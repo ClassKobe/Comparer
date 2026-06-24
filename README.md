@@ -24,7 +24,7 @@ Install dependencies with:
 
 
 Run the program within either an IDE or terminal as such:
-  python3 ebuilder_privv_processor.py
+  python3 PXBComparer.py
 
 A GUI window will open with the following controls.
 
