@@ -47,13 +47,11 @@ Opens a separate window showing a side-by-side dollar comparison of every vendor
 **VENDOR COMPARISON NOTES**
 
 
-- Unmatched eBuilder rows (those with no corresponding PRIVV vendor) are rolled up into the existing "Penn State Office of Physical Plant" vendor row if one exists, or appended as a new row if it does not.
 - The comparison sorts results by the absolute value of the delta, largest discrepancies first.
 - The summary bar at the top of the comparison window shows overall PRIVV total, eBuilder total, and net delta.
 
 
 **KNOWN LIMITATIONS**
 
--Doesn't find new entries assumes that Privv is updated already as this program is meant to identifiy the delta amd not the exact entries within EBuilder.
 - The tool expects eBuilder exports to follow a consistent column order. If your export has a different structure, column mapping may be incorrect.
 - Fuzzy matching uses a low threshold (40) which may occasionally produce incorrect matches. Review the "Match Note" column in the intermediate data if results look unexpected.
