@@ -233,6 +233,65 @@ def normalize(text):
     return text.strip()
 
 
+# Threshold used by find_fuzzy_privv_matches below. Kept as a module-level
+# constant (not hardcoded per-vendor) so it can be tuned in one place if
+# it's ever too loose/strict across the whole PRIVV file.
+PRIVV_VENDOR_FUZZY_THRESHOLD = 87
+
+
+def find_fuzzy_privv_matches(vendor_label: str, privv_df, threshold: int = PRIVV_VENDOR_FUZZY_THRESHOLD):
+    """Return every PRIVV row whose Vendor field is the same company as
+    vendor_label, even if spelled slightly differently (e.g. 'Dobil
+    Laboratories' vs 'Dobil Laboratories Inc'), AND every row where the
+    company name only shows up inside the Description field instead of
+    Vendor (PRIVV files sometimes log a generic bucket like 'Penn State
+    Office of Physical Plant' as the Vendor and put the real company name
+    at the start of the Description, e.g. 'Dobil Laboratories Inc - TV
+    monitors purchased...').
+
+    This intentionally does NOT hardcode any vendor name. A row counts as
+    a match if, after normalize()-ing the relevant text, either:
+      - the Vendor field is identical / a substring match / fuzzy-similar
+        to vendor_label (token_sort_ratio >= threshold), or
+      - the Description field CONTAINS vendor_label as a substring, or
+        scores >= threshold on fuzz.partial_ratio (which finds the best
+        matching substring rather than comparing the whole sentence, so a
+        short vendor name embedded in a longer description still matches).
+    """
+    target = normalize(vendor_label)
+    if not target:
+        return privv_df.iloc[0:0]
+
+    has_vendor = "Vendor" in privv_df.columns
+    has_desc = "Description" in privv_df.columns
+    if not has_vendor and not has_desc:
+        return privv_df.iloc[0:0]
+
+    def _vendor_match(vn: str) -> bool:
+        if not vn:
+            return False
+        if vn == target or vn in target or target in vn:
+            return True
+        return fuzz.token_sort_ratio(vn, target) >= threshold
+
+    def _desc_match(dn: str) -> bool:
+        if not dn:
+            return False
+        if target in dn:
+            return True
+        return fuzz.partial_ratio(target, dn) >= threshold
+
+    def _is_match(row):
+        if has_vendor and _vendor_match(normalize(str(row.get("Vendor", "")))):
+            return True
+        if has_desc and _desc_match(normalize(str(row.get("Description", "")))):
+            return True
+        return False
+
+    mask = privv_df.apply(_is_match, axis=1)
+    return privv_df.loc[mask]
+
+
 def resolve_alias(vendor_raw: str):
     key = vendor_raw.strip().lower()
     if not key:
@@ -938,6 +997,35 @@ def run_comparison():
             if r["Vendor"].strip().lower() not in PSU_NAMES
         ]
 
+    # ── Recompute PRIVV Total with fuzzy matching ───────────────────────────
+    # The PRIVV Total set earlier (vendors_seen exact-match loop) misses rows
+    # where the company name only appears in Description (e.g. Vendor =
+    # "Penn State Office of Physical Plant", Description = "Dobil
+    # Laboratories Inc - ..."), or where the Vendor spelling varies slightly
+    # ("Dobil Laboratories" vs "Dobil Laboratories Inc"). find_fuzzy_privv_matches
+    # is the same lookup used by the entries drilldown window, so recomputing
+    # every row's total with it here keeps the summary table and the
+    # drilldown in agreement instead of only fixing it after a click.
+    for r in comparison_rows:
+        fuzzy_matches = find_fuzzy_privv_matches(r["Vendor"], privv_df)
+        if "_amount_num" in fuzzy_matches.columns:
+            fuzzy_total = fuzzy_matches["_amount_num"].sum()
+        else:
+            fuzzy_total = pd.to_numeric(
+                fuzzy_matches.get("Amount", pd.Series(dtype=str)).astype(str).str.replace(",", "", regex=False),
+                errors="coerce",
+            ).sum()
+        if abs(fuzzy_total - r["PRIVV Total"]) > 0.005:
+            log(f"  Fuzzy PRIVV total fix: '{r['Vendor']}' "
+                f"${r['PRIVV Total']:,.2f} → ${fuzzy_total:,.2f}")
+        r["PRIVV Total"] = fuzzy_total
+        r["Delta"] = r["eBuilder Total"] - r["PRIVV Total"]
+        r["Status"] = (
+            "✅ Match"           if abs(r["Delta"]) < 0.01 else
+            "🔼 eBuilder Higher" if r["eBuilder Total"] > r["PRIVV Total"] else
+            "🔽 eBuilder Lower"
+        )
+
     comparison_rows.sort(key=lambda r: abs(r["Delta"]), reverse=True)
 
     # ── DEBUG: Total entries assigned across all companies ────────────────────
@@ -950,7 +1038,11 @@ def run_comparison():
             log(f"  {r['Vendor'][:45]:<45} {r['eB Matches']:>7}")
     log(f"  {'-'*45} {'-'*7}")
     log(f"  {'TOTAL ENTRIES ASSIGNED':<45} {total_assigned_entries:>7}")
-    log(f"  Total eBuilder rows loaded: {len(eb_raw)}")
+    #log(f"  Total eBuilder rows loaded: {len(eb_raw)}")
+    #Len (eb_raw) Seems to take n-1 number of entrties and is never accurate unless extremely small dataset
+    #Is just a debugging step thus its accuracy does matter but im not gonna stress over it 
+
+
 
     # ── DEBUG: list eBuilder '#' (ID) codes that were actually matched ──────
     # Built from claimed_ids (every row appended into some company's
@@ -980,11 +1072,11 @@ def run_comparison():
     log("────────────────────────────────────────────────────────────────────────\n")
     # ── END DEBUG ─────────────────────────────────────────────────────────────
 
-    show_comparison_window(comparison_rows)
+    show_comparison_window(comparison_rows, privv_df)
     log(f"Comparison complete — {len(comparison_rows)} vendor(s) analyzed.")
 
 
-def show_comparison_window(rows):
+def show_comparison_window(rows, privv_df):
     win = tk.Toplevel(root)
     win.title("Vendor Amount Comparison: PRIVV vs eBuilder")
     win.geometry("1000x520")
@@ -1056,33 +1148,20 @@ def show_comparison_window(rows):
             ), tags=(tag,))
             iid_to_row[iid] = r
 
-    def show_entries_window(event=None):
-        sel = tree.selection()
-        if not sel:
-            return
-        row = iid_to_row.get(sel[0])
-        if row is None:
-            return
-        entries = row.get("_entries", [])
+    def _populate_entries_tree(etree, entries, entry_cols, empty_label):
+        if entries:
+            for e in entries:
+                etree.insert("", "end", values=tuple(
+                    e.get(c, "") for c in entry_cols
+                ))
+        else:
+            etree.insert("", "end", values=(empty_label,) + ("",) * (len(entry_cols) - 1))
 
-        detail = tk.Toplevel(win)
-        detail.title(f"eBuilder Entries — {row['Vendor']}")
-        detail.geometry("1300x460")
-
-        hdr = tk.Frame(detail, bg="#1e1e2e", padx=10, pady=6)
-        hdr.pack(fill="x")
-        tk.Label(
-            hdr,
-            text=f"  Vendor: {row['Vendor']}     "
-                 f"eBuilder Total: ${row['eBuilder Total']:,.2f}     "
-                 f"Entries: {len(entries)}",
-            bg="#1e1e2e", fg="white", font=("Consolas", 10, "bold"), anchor="w"
-        ).pack(fill="x")
-
+    def _build_entries_tab(parent, entries, fallback_cols, col_widths, empty_label):
         # Build the column list from whatever fields are actually present
         # on the entries (full line item) rather than a fixed subset, so
-        # every field captured for that eBuilder row gets shown. Order is
-        # preserved based on first appearance across all entries.
+        # every field captured for that row gets shown. Order is preserved
+        # based on first appearance across all entries.
         if entries:
             entry_cols = []
             seen = set()
@@ -1092,9 +1171,9 @@ def show_comparison_window(rows):
                         seen.add(k)
                         entry_cols.append(k)
         else:
-            entry_cols = list(ENTRY_COLS)
+            entry_cols = list(fallback_cols)
 
-        ef = tk.Frame(detail)
+        ef = tk.Frame(parent)
         ef.pack(fill="both", expand=True, padx=8, pady=6)
 
         evsb = ttk.Scrollbar(ef, orient="vertical")
@@ -1109,34 +1188,100 @@ def show_comparison_window(rows):
         money_cols = {
             "Commitment Amount", "Current Commitment",
             "Projected Commitment", "Actuals Approved", "Remaining Balance",
+            "Amount",
         }
-        ecol_widths = {
+        for c in entry_cols:
+            etree.heading(c, text=c)
+            etree.column(c, width=col_widths.get(c, 130),
+                         anchor="e" if c in money_cols else "w")
+
+        _populate_entries_tree(etree, entries, entry_cols, empty_label)
+
+        evsb.pack(side="right", fill="y")
+        ehsb.pack(side="bottom", fill="x")
+        etree.pack(fill="both", expand=True)
+        return etree
+
+    def show_entries_window(event=None):
+        sel = tree.selection()
+        if not sel:
+            return
+        row = iid_to_row.get(sel[0])
+        if row is None:
+            return
+        eb_entries = row.get("_entries", [])
+
+        # Fuzzy-match PRIVV rows for this same company on the fly (no
+        # hardcoded vendor names — see find_fuzzy_privv_matches), rather
+        # than threading a separate _privv_entries field through every
+        # matching pass.
+        privv_matches = find_fuzzy_privv_matches(row["Vendor"], privv_df)
+        privv_entries = privv_matches.to_dict("records")
+        # Use the sum of what's ACTUALLY shown in the PRIVV tab (fuzzy
+        # matches), not row["PRIVV Total"] — that field comes from the
+        # earlier exact-match aggregation pass and won't reflect rows that
+        # only the fuzzy/Description matching here picked up.
+        if "_amount_num" in privv_matches.columns:
+            privv_total_fuzzy = privv_matches["_amount_num"].sum()
+        else:
+            privv_total_fuzzy = pd.to_numeric(
+                privv_matches.get("Amount", pd.Series(dtype=str)).astype(str).str.replace(",", "", regex=False),
+                errors="coerce",
+            ).sum()
+
+        detail = tk.Toplevel(win)
+        detail.title(f"Entries — {row['Vendor']}")
+        detail.geometry("1300x500")
+
+        privv_total_note = ""
+        if abs(privv_total_fuzzy - row["PRIVV Total"]) > 0.005:
+            privv_total_note = f" (was ${row['PRIVV Total']:,.2f} in summary)"
+
+        hdr = tk.Frame(detail, bg="#1e1e2e", padx=10, pady=6)
+        hdr.pack(fill="x")
+        tk.Label(
+            hdr,
+            text=f"  Vendor: {row['Vendor']}     "
+                 f"eBuilder Total: ${row['eBuilder Total']:,.2f}     "
+                 f"PRIVV Total: ${privv_total_fuzzy:,.2f}{privv_total_note}     "
+                 f"eB Entries: {len(eb_entries)}     "
+                 f"PRIVV Entries: {len(privv_entries)}",
+            bg="#1e1e2e", fg="white", font=("Consolas", 10, "bold"), anchor="w"
+        ).pack(fill="x")
+
+        nb = ttk.Notebook(detail)
+        nb.pack(fill="both", expand=True, padx=8, pady=6)
+
+        eb_tab = tk.Frame(nb)
+        privv_tab = tk.Frame(nb)
+        nb.add(eb_tab, text=f"eBuilder Entries ({len(eb_entries)})")
+        nb.add(privv_tab, text=f"PRIVV Entries ({len(privv_entries)})")
+
+        eb_col_widths = {
             "ID": 70, "Description": 260, "Company": 200,
             "Date": 90, "Status": 100, "Commitment Type": 130,
             "Commitment Amount": 130, "Current Commitment": 130,
             "Projected Commitment": 130, "Actuals Approved": 130,
             "Remaining Balance": 130,
         }
-        for c in entry_cols:
-            etree.heading(c, text=c)
-            etree.column(c, width=ecol_widths.get(c, 130),
-                         anchor="e" if c in money_cols else "w")
+        _build_entries_tab(
+            eb_tab, eb_entries, ENTRY_COLS, eb_col_widths,
+            "(No eBuilder entries found)",
+        )
 
-        if entries:
-            for e in entries:
-                etree.insert("", "end", values=tuple(
-                    e.get(c, "") for c in entry_cols
-                ))
-        else:
-            etree.insert("", "end", values=("(No eBuilder entries found)",) + ("",) * (len(entry_cols) - 1))
-
-        evsb.pack(side="right", fill="y")
-        ehsb.pack(side="bottom", fill="x")
-        etree.pack(fill="both", expand=True)
+        privv_col_widths = {
+            "Vendor": 220, "Description": 280, "Amount": 130,
+            "Date": 90, "Status": 100, "Item": 90, "Type": 130,
+        }
+        _build_entries_tab(
+            privv_tab, privv_entries, list(privv_df.columns), privv_col_widths,
+            "(No PRIVV entries found)",
+        )
 
         tk.Button(detail, text="Close", command=detail.destroy, padx=10).pack(pady=6)
 
     tree.bind("<Double-1>", show_entries_window)
+
 
     populate_tree()
     search_var.trace_add("write", lambda *_: populate_tree(search_var.get()))
@@ -1321,9 +1466,6 @@ output_box = tk.Text(root, height=18, width=100)
 output_box.pack(pady=10, padx=10)
 
 root.mainloop()
-
-
-#06/24/2026 Current code handles debugging and display unaccounted for rows. question is how ot minimize un accounted for rows
 
 
 #06/24/2026 Current code handles debugging and display unaccounted for rows. question is how ot minimize un accounted for rows
