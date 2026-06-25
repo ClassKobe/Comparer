@@ -44,14 +44,19 @@ Compare Vendors:
 Opens a separate window showing a side-by-side dollar comparison of every vendor found in the PRIVV file against the matched totals in eBuilder. Rows are color coded: green for matches, yellow when eBuilder is higher, red when eBuilder is lower, and gray when no data exists on either side. You can filter by vendor name and export the comparison to CSV.
 
 
+Step 4 - After Steps
+
+You're able to double click the Vendors and view the Ebuilder & Privv entries that are populating that budget, within the double click GUI look at the top left and view the EBuilder and Privv Entries tabs to switch between the two. 
+
 **VENDOR COMPARISON NOTES**
 
 
 - The comparison sorts results by the absolute value of the delta, largest discrepancies first.
 - The summary bar at the top of the comparison window shows overall PRIVV total, eBuilder total, and net delta.
+- USE DOUBLE CLICK TO VIEW ENTRIES THAT ARE POPULATING THE DATA ENTRY
 
 
 **KNOWN LIMITATIONS**
 
 - The tool expects eBuilder exports to follow a consistent column order. If your export has a different structure, column mapping may be incorrect.
-- Fuzzy matching uses a low threshold (40) which may occasionally produce incorrect matches. Review the "Match Note" column in the intermediate data if results look unexpected.
+- Fuzzy matching uses two different thresholds based off of what function the code is calling (aka based on what it does its more strict or lenient. 
