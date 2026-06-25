@@ -4,6 +4,9 @@ import re
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from rapidfuzz import fuzz, process
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 
 OUTPUT_FILE = "privv_importable.csv"
 
@@ -1039,10 +1042,6 @@ def run_comparison():
     log(f"  {'-'*45} {'-'*7}")
     log(f"  {'TOTAL ENTRIES ASSIGNED':<45} {total_assigned_entries:>7}")
     #log(f"  Total eBuilder rows loaded: {len(eb_raw)}")
-    #Len (eb_raw) Seems to take n-1 number of entrties and is never accurate unless extremely small dataset
-    #Is just a debugging step thus its accuracy does matter but im not gonna stress over it 
-
-
 
     # ── DEBUG: list eBuilder '#' (ID) codes that were actually matched ──────
     # Built from claimed_ids (every row appended into some company's
@@ -1304,17 +1303,111 @@ def show_comparison_window(rows, privv_df):
     ]:
         tk.Label(legend, text=f"  {label}  ", bg=color, relief="solid", bd=1, padx=6, pady=2).pack(side="left", padx=4)
 
+    STATUS_FILL = {
+        "✅ Match":           "C6EFCE",
+        "🔼 eBuilder Higher": "FFEB9C",
+        "🔽 eBuilder Lower":  "FFC7CE",
+        "⚪ No Data":          "E2E3E5",
+    }
+    HEADER_FILL = PatternFill("solid", start_color="1E1E2E", end_color="1E1E2E")
+    HEADER_FONT = Font(name="Calibri", bold=True, color="FFFFFF")
+    BASE_FONT   = Font(name="Calibri")
+    THIN = Side(style="thin", color="D9D9D9")
+    BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
+
+    def _style_header(ws, headers):
+        for c, h in enumerate(headers, start=1):
+            cell = ws.cell(row=1, column=c, value=h)
+            cell.font = HEADER_FONT
+            cell.fill = HEADER_FILL
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+        ws.freeze_panes = "A2"
+
+    def _autosize(ws, n_cols, min_w=10, max_w=55):
+        for c in range(1, n_cols + 1):
+            letter = get_column_letter(c)
+            longest = max(
+                (len(str(cell.value)) for cell in ws[letter] if cell.value is not None),
+                default=min_w,
+            )
+            ws.column_dimensions[letter].width = max(min_w, min(longest + 2, max_w))
+
     def export_comparison():
         path = filedialog.asksaveasfilename(
-            defaultextension=".csv",
-            filetypes=[("CSV Files", "*.csv")],
+            defaultextension=".xlsx",
+            filetypes=[("Excel Files", "*.xlsx")],
             title="Save comparison as..."
         )
-        if path:
-            pd.DataFrame(rows).to_csv(path, index=False)
-            messagebox.showinfo("Exported", f"Saved to {path}")
+        if not path:
+            return
 
-    tk.Button(win, text="Export to CSV", command=export_comparison, bg="#0066cc", fg="white", padx=8).pack(pady=6)
+        wb = openpyxl.Workbook()
+
+        # ── Summary sheet ────────────────────────────────────────────────
+        ws = wb.active
+        ws.title = "Summary"
+        headers = ["Vendor", "eBuilder Total", "PRIVV Total", "Delta",
+                   "Status", "eB Matches"]
+        _style_header(ws, headers)
+
+        money_cols = {2, 3, 4}
+        for r_idx, r in enumerate(rows, start=2):
+            values = [
+                r.get("Vendor", ""),
+                r.get("eBuilder Total", 0) or 0,
+                r.get("PRIVV Total", 0) or 0,
+                r.get("Delta", 0) or 0,
+                r.get("Status", ""),
+                r.get("eB Matches", 0) or 0,
+            ]
+            fill = PatternFill("solid", start_color=STATUS_FILL.get(r.get("Status", ""), "FFFFFF"))
+            for c_idx, val in enumerate(values, start=1):
+                cell = ws.cell(row=r_idx, column=c_idx, value=val)
+                cell.font = BASE_FONT
+                cell.border = BORDER
+                cell.fill = fill
+                if c_idx in money_cols:
+                    cell.number_format = '$#,##0.00;($#,##0.00);"-"'
+                if c_idx == 5:
+                    cell.alignment = Alignment(horizontal="center")
+        _autosize(ws, len(headers))
+
+        # ── eBuilder Entries sheet ───────────────────────────────────────
+        eb_sheet = wb.create_sheet("eBuilder Entries")
+        eb_headers = ["Vendor"] + list(ENTRY_COLS)
+        _style_header(eb_sheet, eb_headers)
+        r_idx = 2
+        for r in rows:
+            for e in r.get("_entries", []):
+                row_vals = [r.get("Vendor", "")] + [e.get(c, "") for c in ENTRY_COLS]
+                for c_idx, val in enumerate(row_vals, start=1):
+                    cell = eb_sheet.cell(row=r_idx, column=c_idx, value=val)
+                    cell.font = BASE_FONT
+                    cell.border = BORDER
+                r_idx += 1
+        _autosize(eb_sheet, len(eb_headers))
+
+        # ── PRIVV Entries sheet (same fuzzy match used in the drilldown) ──
+        privv_sheet = wb.create_sheet("PRIVV Entries")
+        privv_cols = list(privv_df.columns.drop("_amount_num", errors="ignore"))
+        privv_headers = ["Matched To Vendor"] + privv_cols
+        _style_header(privv_sheet, privv_headers)
+        r_idx = 2
+        for r in rows:
+            matches = find_fuzzy_privv_matches(r["Vendor"], privv_df)
+            for _, prow in matches.iterrows():
+                row_vals = [r.get("Vendor", "")] + [prow.get(c, "") for c in privv_cols]
+                for c_idx, val in enumerate(row_vals, start=1):
+                    cell = privv_sheet.cell(row=r_idx, column=c_idx, value=val)
+                    cell.font = BASE_FONT
+                    cell.border = BORDER
+                r_idx += 1
+        _autosize(privv_sheet, len(privv_headers))
+
+        wb.save(path)
+        messagebox.showinfo("Exported", f"Saved to {path}")
+
+    tk.Button(win, text="Export to Excel", command=export_comparison, bg="#0066cc", fg="white", padx=8).pack(pady=6)
 
 
 # ---------------------------------------------------------------------------
@@ -1466,6 +1559,9 @@ output_box = tk.Text(root, height=18, width=100)
 output_box.pack(pady=10, padx=10)
 
 root.mainloop()
+
+
+#06/24/2026 Current code handles debugging and display unaccounted for rows. question is how ot minimize un accounted for rows
 
 
 #06/24/2026 Current code handles debugging and display unaccounted for rows. question is how ot minimize un accounted for rows
