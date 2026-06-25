@@ -16,6 +16,7 @@ Install dependencies with:
   - pandas
   - rapidfuzz
   - tkinter (included with most Python installations)
+  - openpyxl
 
 
 
