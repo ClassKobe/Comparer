@@ -215,9 +215,19 @@ VENDOR_ALIASES = {
     # Johnson Controls
     "johnson contrl security solutions":                                  "JOHNSON CONTROLS US HOLDINGS LLC JOHNSON CONTROLS SECURITY SOLUTIONS",
     "johnson controls us holdings llc johnson controls security solutions": "Johnson Control Security Solutions",
+    "tuckahoe turf farms inc":                                                  "Hummer Turfgrass Systems Inc",
+    "tuckahoe turf farms":                                                      "Hummer Turfgrass Systems Inc",
     "SGH":                                                                 "Simpson Gumpertz & Heger, Inc.^",
     "AD/S":                                         "ARCHITECTURAL DESIGN & SIGNS INC^",
     "AJP":                                          ["ANTHONY JAMES PARTNERS LLC ^"," Anthony James"],
+
+    # Dobil Laboratories — normalize eBuilder full legal name to PRIVV short name.
+    # eBuilder uses "DOBIL LABORATORIES INC"; PRIVV may list it as "Dobil Laboratories".
+    # These aliases let the comparison loop find the match without touching any
+    # other vendor (Clair Global, CDW, etc.).
+    "dobil laboratories inc":                        "Dobil Laboratories",
+    "dobil laboratories":                            "Dobil Laboratories",
+    "dobil":                                         "Dobil Laboratories",
 }
 
 DEFAULT_CODE = "901"
@@ -277,16 +287,34 @@ def find_fuzzy_privv_matches(vendor_label: str, privv_df, threshold: int = PRIVV
             return True
         return fuzz.token_sort_ratio(vn, target) >= threshold
 
+    # Vendors that appear in PSU OPP Description fields but must NOT be
+    # claimed by their own vendor bucket via description matching — those rows
+    # belong to Penn State OPP, not to the named vendor.
+    DESC_MATCH_BLOCKLIST = {"clair global", "clair global corporation",
+                            "clair global integration llc"}
+
     def _desc_match(dn: str) -> bool:
+        """Return True only when the target vendor name appears at the VERY
+        START of the Description (e.g. 'Dobil Laboratories Inc - TV monitors
+        purchased...').  Requiring a leading match prevents a vendor name that
+        appears mid-sentence (e.g. 'Clair Global - OPP Audio Maintenance'
+        inside a Penn State OPP row) from incorrectly pulling that row into
+        the named vendor's PRIVV total."""
         if not dn:
             return False
-        if target in dn:
-            return True
-        return fuzz.partial_ratio(target, dn) >= threshold
+        # Block vendors whose PSU OPP description rows must stay with PSU OPP.
+        if target in DESC_MATCH_BLOCKLIST:
+            return False
+        # Only match when target appears at the start of the description.
+        return dn.startswith(target)
 
     def _is_match(row):
         if has_vendor and _vendor_match(normalize(str(row.get("Vendor", "")))):
             return True
+        # Also check Description — PRIVV sometimes logs a generic bucket like
+        # "Penn State Office of Physical Plant" as Vendor and puts the real
+        # company name at the start of Description (e.g. "Dobil Laboratories
+        # Inc - TV monitors purchased...").
         if has_desc and _desc_match(normalize(str(row.get("Description", "")))):
             return True
         return False
@@ -488,6 +516,8 @@ def run_comparison():
     privv_df["_amount_num"] = pd.to_numeric(
         privv_df["Amount"].str.replace(",", "", regex=False), errors="coerce"
     ).fillna(0)
+    privv_total_all = privv_df["_amount_num"].sum()
+    log(f"  PRIVV file loaded: {len(privv_df)} entries, total amount = ${privv_total_all:,.2f}")
 
     data_list = []
     for f in ebuilder_files:
@@ -637,6 +667,7 @@ def run_comparison():
 
         if eb_total == 0 and privv_total == 0:
             status = "⚪ No Data"
+        #Future iterations or people working on this can potentially remove this line above as ngl its kinda pointless why in the world would we have a instance with zero information in both softwares
         elif abs(delta) < 0.01:
             status = "✅ Match"
         elif eb_total > privv_total:
