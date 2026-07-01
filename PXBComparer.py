@@ -360,7 +360,11 @@ def convert_date(val):
 
 def normalize_date_to_tuple(val):
     """Parse both eBuilder (MM.DD.YYYY) and Privv (M/D/YYYY) date formats
-    into a comparable (year, month, day) tuple. Returns None on failure."""
+    into a comparable (year, month, day) tuple. Returns None on failure.
+
+    Handles stray non-date strings (e.g. 'Status', 'N/A', header text leaked
+    into the Date column) by returning None instead of raising ValueError.
+    """
     try:
         val = str(val).strip()
         if not val:
@@ -373,7 +377,13 @@ def normalize_date_to_tuple(val):
             return None
         if len(parts) != 3:
             return None
+        # Guard: all three parts must be purely numeric before calling int()
+        if not all(p.strip().isdigit() for p in parts):
+            return None
         m, d, y = int(parts[0]), int(parts[1]), int(parts[2])
+        # Sanity-check the ranges so completely bogus values don't slip through
+        if not (1 <= m <= 12 and 1 <= d <= 31 and 1900 <= y <= 2100):
+            return None
         return (y, m, d)
     except Exception:
         return None
@@ -1559,7 +1569,17 @@ root = tk.Tk()
 root.title("EBuilder → PRIVV Processor (Weighted Classifier + Fuzzy Match)")
 root.resizable(True, True)
 
-frame = tk.Frame(root)
+# ── Top-level notebook (tabs) ────────────────────────────────────────────────
+notebook = ttk.Notebook(root)
+notebook.pack(fill="both", expand=True, padx=6, pady=6)
+
+# ════════════════════════════════════════════════════════════════════════════
+# TAB 1 — COMPARISONS  (original UI, unchanged)
+# ════════════════════════════════════════════════════════════════════════════
+comp_tab = tk.Frame(notebook)
+notebook.add(comp_tab, text="Comparisons")
+
+frame = tk.Frame(comp_tab)
 frame.pack(pady=10, padx=10, fill="x")
 
 tk.Button(frame, text="Select eBuilder Files", command=select_ebuilder_files, width=22).grid(
@@ -1577,22 +1597,805 @@ tk.Button(frame, text="Select PRIVV File", command=select_privv_file, width=22).
 privv_label = tk.Label(frame, text="No PRIVV file selected.", fg="gray", anchor="w")
 privv_label.grid(row=1, column=2, padx=5, sticky="w")
 
-btn_frame = tk.Frame(root)
+btn_frame = tk.Frame(comp_tab)
 btn_frame.pack(pady=4)
-
 
 tk.Button(
     btn_frame, text="Compare Vendors", command=run_comparison,
     bg="#0066cc", fg="white", width=18, padx=6
 ).pack(side="left", padx=8)
 
-output_box = tk.Text(root, height=18, width=100)
+output_box = tk.Text(comp_tab, height=18, width=100)
 output_box.pack(pady=10, padx=10)
+
+# ════════════════════════════════════════════════════════════════════════════
+# TAB 2 — INVOICES
+# ════════════════════════════════════════════════════════════════════════════
+inv_tab = tk.Frame(notebook)
+notebook.add(inv_tab, text="Invoices")
+
+# ── Invoice file state ───────────────────────────────────────────────────────
+invoice_eb_file:    str = ""
+invoice_privv_file: str = ""
+
+# ── File-picker helpers ──────────────────────────────────────────────────────
+inv_frame = tk.Frame(inv_tab)
+inv_frame.pack(pady=10, padx=10, fill="x")
+
+def select_invoice_eb_file():
+    global invoice_eb_file
+    f = filedialog.askopenfilename(
+        title="Select eBuilder Invoice CSV",
+        filetypes=[("CSV Files", "*.csv")]
+    )
+    if f:
+        invoice_eb_file = f
+        inv_eb_label.config(text=f"✅ {os.path.basename(f)}", fg="green")
+    else:
+        if not invoice_eb_file:
+            inv_eb_label.config(text="No eBuilder invoice file selected.", fg="gray")
+
+def select_invoice_privv_file():
+    global invoice_privv_file
+    f = filedialog.askopenfilename(
+        title="Select PRIVV Invoice CSV",
+        filetypes=[("CSV Files", "*.csv")]
+    )
+    if f:
+        invoice_privv_file = f
+        inv_privv_label.config(text=f"✅ {os.path.basename(f)}", fg="green")
+    else:
+        if not invoice_privv_file:
+            inv_privv_label.config(text="No PRIVV invoice file selected.", fg="gray")
+
+tk.Button(inv_frame, text="Select eBuilder Invoice File",  command=select_invoice_eb_file,    width=26).grid(row=0, column=0, padx=5, pady=4, sticky="w")
+inv_eb_label = tk.Label(inv_frame, text="No eBuilder invoice file selected.", fg="gray", anchor="w")
+inv_eb_label.grid(row=0, column=1, padx=5, sticky="w")
+
+tk.Button(inv_frame, text="Select PRIVV Invoice File", command=select_invoice_privv_file, width=26).grid(row=1, column=0, padx=5, pady=4, sticky="w")
+inv_privv_label = tk.Label(inv_frame, text="No PRIVV invoice file selected.", fg="gray", anchor="w")
+inv_privv_label.grid(row=1, column=1, padx=5, sticky="w")
+
+inv_btn_frame = tk.Frame(inv_tab)
+inv_btn_frame.pack(pady=4)
+
+
+def inv_log(msg: str):
+    inv_output_box.insert(tk.END, msg + "\n")
+    inv_output_box.see(tk.END)
+
+
+def normalize_commit_num(val: str) -> str:
+    """Strip leading zeros and non-digit characters for a numeric key comparison."""
+    val = str(val).strip()
+    digits = re.sub(r"[^0-9]", "", val)
+    return str(int(digits)) if digits else ""
+
+
+# ---------------------------------------------------------------------------
+# INVOICE COMPARISON LOGIC
+# ---------------------------------------------------------------------------
+def run_invoice_comparison():
+    global invoice_eb_file, invoice_privv_file
+
+    if not invoice_eb_file:
+        messagebox.showerror("Error", "Select an eBuilder invoice file first.", parent=inv_tab)
+        return
+    if not invoice_privv_file:
+        messagebox.showerror("Error", "Select a PRIVV invoice file first.", parent=inv_tab)
+        return
+
+    inv_log("\n── Running Invoice Comparison ─────────────────────────────────────")
+
+    # ── Load files ────────────────────────────────────────────────────────────
+    eb_inv  = pd.read_csv(invoice_eb_file,    dtype=str).fillna("")
+    prv_inv = pd.read_csv(invoice_privv_file, dtype=str).fillna("")
+
+    # ── Validate required columns ─────────────────────────────────────────────
+    eb_required  = {"Commitment #", "Invoice Amount"}
+    prv_required = {"Vendor #", "Amount"}
+
+    missing_eb  = eb_required  - set(eb_inv.columns)
+    missing_prv = prv_required - set(prv_inv.columns)
+    if missing_eb:
+        messagebox.showerror("Error", f"eBuilder invoice file is missing columns: {missing_eb}", parent=inv_tab)
+        return
+    if missing_prv:
+        messagebox.showerror("Error", f"PRIVV invoice file is missing columns: {missing_prv}", parent=inv_tab)
+        return
+
+    inv_log(f"  eBuilder invoices loaded  : {len(eb_inv)} rows")
+    inv_log(f"  PRIVV invoices loaded     : {len(prv_inv)} rows")
+
+    # ── Parse amounts to numeric ──────────────────────────────────────────────
+    eb_inv["_amount_num"] = pd.to_numeric(
+        eb_inv["Invoice Amount"].str.replace(",", "", regex=False), errors="coerce"
+    ).fillna(0)
+
+    prv_inv["_amount_num"] = pd.to_numeric(
+        prv_inv["Amount"].str.replace(",", "", regex=False), errors="coerce"
+    ).fillna(0)
+
+    # ── Normalize join keys ───────────────────────────────────────────────────
+    # eBuilder  → Commitment # (e.g. "000925000")
+    # PRIVV     → Vendor #     (e.g. "8103142")
+    eb_inv["_commit_key"]  = eb_inv["Commitment #"].apply(normalize_commit_num)
+    prv_inv["_vendor_key"] = prv_inv["Vendor #"].apply(normalize_commit_num)
+
+    # ── Build PRIVV lookup: vendor_key → rows ─────────────────────────────────
+    prv_by_key: dict = {}
+    for _, row in prv_inv.iterrows():
+        k = row["_vendor_key"]
+        if k:
+            prv_by_key.setdefault(k, []).append(row)
+
+    # ── Build PRIVV vendor-name list for fuzzy fallback ───────────────────────
+    prv_vendor_names: list = []
+    _seen_pv: set = set()
+    for _, row in prv_inv.iterrows():
+        vname = str(row.get("Vendor", "")).strip()
+        if vname and normalize(vname) not in _seen_pv:
+            _seen_pv.add(normalize(vname))
+            prv_vendor_names.append(vname)
+
+    INV_FUZZY_THRESHOLD = 72
+
+    def _alias_find_prv_vendor(eb_row) -> str | None:
+        """Return a PRIVV vendor label for an eBuilder invoice row using
+        VENDOR_ALIASES (the same alias map the budget side uses), checking
+        the Company and Description fields. This runs BEFORE the generic
+        fuzzy fallback so known eBuilder/PRIVV name mismatches (e.g. "DOBIL
+        LABORATORIES INC" -> "Dobil Laboratories") resolve correctly here
+        too, instead of only on the budget side."""
+        for field_val in [str(eb_row.get("Company", "")).strip(),
+                           str(eb_row.get("Description", "")).strip()]:
+            if not field_val:
+                continue
+            for candidate in resolve_alias_list(field_val):
+                if not candidate or normalize(candidate) == normalize(field_val):
+                    continue  # resolve_alias_list returned the input unchanged -> no alias hit
+                # Prefer matching the alias's canonical name to an actual
+                # PRIVV vendor name so it lines up with existing comparison
+                # rows / totals built from prv_inv.
+                for pv in prv_vendor_names:
+                    npv, ncand = normalize(pv), normalize(candidate)
+                    if npv == ncand or ncand in npv or npv in ncand:
+                        return pv
+                # No exact PRIVV vendor match, but the alias's canonical
+                # name may still match an existing comparison row label
+                # (e.g. multi-string JV aliases) — return it as-is.
+                return candidate
+        return None
+
+    def _fuzzy_find_prv_vendor(eb_row) -> str | None:
+        """Return the best PRIVV vendor name for an eBuilder row whose
+        Commitment # is blank, using Company / Description fuzzy match."""
+        company = str(eb_row.get("Company", "")).strip()
+        desc    = str(eb_row.get("Description", "")).strip()
+        if not prv_vendor_names or (not company and not desc):
+            return None
+        candidates = []
+        for field_val in [company, desc]:
+            if not field_val:
+                continue
+            m = process.extractOne(
+                normalize(field_val),
+                [normalize(v) for v in prv_vendor_names],
+                scorer=fuzz.token_set_ratio,
+                score_cutoff=INV_FUZZY_THRESHOLD,
+            )
+            if m:
+                _, score, idx = m
+                candidates.append((prv_vendor_names[idx], score))
+        if not candidates:
+            return None
+        return max(candidates, key=lambda x: x[1])[0]
+
+    # ── Main comparison pass ──────────────────────────────────────────────────
+    # Iterate over every unique Commitment # seen on the PRIVV side (Vendor #),
+    # find corresponding eBuilder rows by Commitment #, compute totals & delta.
+    comparison_rows: list = []
+    all_matched_eb_indices: set = set()
+
+    # Collect all unique PRIVV vendor # keys (these drive the rows).
+    # If the vendor name is Penn State OPP (any variant), always use the
+    # canonical PSU_OPP_LABEL so all PSU rows collapse into one line item.
+    PSU_OPP_LABEL = "Penn State Office of Physical Plant"
+    PSU_OPP_KEY   = normalize(PSU_OPP_LABEL)
+    PSU_NAME_VARIANTS = {
+        "penn state office of physical plant",
+        "pennsylvania state university",
+        "the pennsylvania state university",
+        "penn state opp",
+        "psu opp",
+    }
+
+    def _make_label(vendor_name: str, vendor_num: str) -> str:
+        """Return PSU_OPP_LABEL for any Penn State variant; otherwise just the
+        vendor name (no Vendor # suffix).  Dropping the number means two PRIVV
+        rows for the same company with different Vendor #s get the same label
+        and are automatically collapsed by the merge-duplicates pass."""
+        if normalize(vendor_name) in PSU_NAME_VARIANTS:
+            return PSU_OPP_LABEL
+        return vendor_name if vendor_name else f"#{vendor_num}"
+
+    prv_keys_seen: dict = {}  # key -> display label
+    for _, row in prv_inv.iterrows():
+        k = row["_vendor_key"]
+        if k and k not in prv_keys_seen:
+            vendor_name = str(row.get("Vendor", "")).strip()
+            vendor_num  = str(row.get("Vendor #", "")).strip()
+            prv_keys_seen[k] = _make_label(vendor_name, vendor_num)
+
+    for key, label in prv_keys_seen.items():
+        # PRIVV side: all rows for this Vendor #
+        prv_rows = prv_by_key.get(key, [])
+        prv_total = sum(float(r["_amount_num"]) for r in prv_rows)
+
+        # eBuilder side: all rows whose Commitment # normalizes to the same key
+        eb_mask = eb_inv["_commit_key"] == key
+        eb_total = eb_inv.loc[eb_mask, "_amount_num"].sum()
+        eb_count = int(eb_mask.sum())
+        all_matched_eb_indices.update(eb_inv[eb_mask].index.tolist())
+
+        delta = eb_total - prv_total
+        if eb_total == 0 and prv_total == 0:
+            status = "⚪ No Data"
+        elif abs(delta) < 0.01:
+            status = "✅ Match"
+        elif eb_total > prv_total:
+            status = "🔼 eBuilder Higher"
+        else:
+            status = "🔽 eBuilder Lower"
+
+        # If this key maps to PSU OPP and we already have a PSU OPP row,
+        # merge into it instead of adding a duplicate line.
+        existing_psu = next(
+            (r for r in comparison_rows if normalize(r["Label"]) == PSU_OPP_KEY),
+            None,
+        ) if label == PSU_OPP_LABEL else None
+
+        if existing_psu:
+            existing_psu["PRIVV Total"]    += prv_total
+            existing_psu["eBuilder Total"] += eb_total
+            existing_psu["eB Matches"]     += eb_count
+            existing_psu["_eb_entries"].extend(eb_inv[eb_mask].to_dict("records"))
+            existing_psu["_prv_entries"].extend([dict(r) for r in prv_rows])
+            existing_psu["Delta"]  = existing_psu["eBuilder Total"] - existing_psu["PRIVV Total"]
+            existing_psu["Status"] = (
+                "✅ Match"           if abs(existing_psu["Delta"]) < 0.01 else
+                "🔼 eBuilder Higher" if existing_psu["eBuilder Total"] > existing_psu["PRIVV Total"] else
+                "🔽 eBuilder Lower"
+            )
+        else:
+            comparison_rows.append({
+                "Label":          label,
+                "Commit Key":     key,
+                "PRIVV Total":    prv_total,
+                "eBuilder Total": eb_total,
+                "Delta":          delta,
+                "eB Matches":     eb_count,
+                "Status":         status,
+                "_eb_entries":    eb_inv[eb_mask].to_dict("records"),
+                "_prv_entries":   [dict(r) for r in prv_rows],
+            })
+
+    # ── Helper: add rows into the PSU OPP bucket ─────────────────────────────
+    # PSU_OPP_LABEL / PSU_OPP_KEY are defined above in the label-building block.
+
+    def _add_to_inv_psu(rows_list, reason: str):
+        """Merge a list of eBuilder invoice rows into the PSU OPP comparison row."""
+        if not rows_list:
+            return
+        amount  = sum(float(r["_amount_num"]) for r in rows_list)
+        n_rows  = len(rows_list)
+        entries = [dict(r) for r in rows_list]
+        existing = next(
+            (r for r in comparison_rows if normalize(r["Label"]) == PSU_OPP_KEY),
+            None,
+        )
+        for eb_row in rows_list:
+            inv_log(f"    PSU OPP [{reason}]: "
+                    f"Invoice #{eb_row.get('Invoice #','')} | "
+                    f"{eb_row.get('Company','')} | "
+                    f"${float(eb_row['_amount_num']):,.2f}")
+        if existing:
+            existing["eBuilder Total"] += amount
+            existing["eB Matches"]     += n_rows
+            existing["_eb_entries"].extend(entries)
+            existing["Delta"]  = existing["eBuilder Total"] - existing["PRIVV Total"]
+            existing["Status"] = (
+                "✅ Match"           if abs(existing["Delta"]) < 0.01 else
+                "🔼 eBuilder Higher" if existing["eBuilder Total"] > existing["PRIVV Total"] else
+                "🔽 eBuilder Lower"
+            )
+        else:
+            # PSU OPP not yet in comparison_rows — pull its PRIVV rows too
+            prv_psu_mask = prv_inv["Vendor"].apply(
+                lambda v: normalize(str(v)) == PSU_OPP_KEY
+            )
+            prv_psu_total = prv_inv.loc[prv_psu_mask, "_amount_num"].sum()
+            prv_psu_rows  = prv_inv[prv_psu_mask].to_dict("records")
+            delta = amount - prv_psu_total
+            comparison_rows.append({
+                "Label":          PSU_OPP_LABEL,
+                "Commit Key":     "",
+                "PRIVV Total":    prv_psu_total,
+                "eBuilder Total": amount,
+                "Delta":          delta,
+                "eB Matches":     n_rows,
+                "Status":         (
+                    "✅ Match"           if abs(delta) < 0.01 else
+                    "🔼 eBuilder Higher" if amount > prv_psu_total else
+                    "🔽 eBuilder Lower"
+                ),
+                "_eb_entries":    entries,
+                "_prv_entries":   prv_psu_rows,
+            })
+
+    # ── Build PSU OPP date set from PRIVV invoices ────────────────────────────
+    # Mirrors the same heuristic used on the budget/commitment tab: an
+    # unmatched eBuilder row is only routed to PSU OPP if it actually looks
+    # like it belongs there (Penn keyword or a date PRIVV logged against
+    # PSU OPP) — NOT just because nothing else matched.
+    psu_inv_dates: set = set()
+    inv_date_col = None
+    for candidate_col in ("Invoice Date", "Date"):
+        if candidate_col in prv_inv.columns:
+            inv_date_col = candidate_col
+            break
+    if inv_date_col:
+        psu_prv_date_mask = prv_inv["Vendor"].apply(
+            lambda v: normalize(str(v)) in PSU_NAME_VARIANTS
+        )
+        for raw_date in prv_inv.loc[psu_prv_date_mask, inv_date_col]:
+            tup = normalize_date_to_tuple(raw_date)
+            if tup:
+                psu_inv_dates.add(tup)
+    if psu_inv_dates:
+        inv_log(f"  PSU OPP PRIVV invoice dates loaded: {len(psu_inv_dates)} date(s)")
+
+    def _eb_inv_date_matches_psu(eb_date_val) -> bool:
+        tup = normalize_date_to_tuple(eb_date_val)
+        return tup is not None and tup in psu_inv_dates
+
+    eb_date_col = "Date Received" if "Date Received" in eb_inv.columns else None
+
+    def _add_to_new_inv_company(eb_row):
+        """Add a genuinely unmatched eBuilder invoice row as its own new
+        line item, instead of silently sweeping it into PSU OPP."""
+        company = str(eb_row.get("Company", "")).strip()
+        desc    = str(eb_row.get("Description", "")).strip()
+        label   = company or (desc[:40].strip() if desc else "") or \
+                  f"Unmatched (Invoice #{eb_row.get('Invoice #','')})"
+        amount  = float(eb_row["_amount_num"])
+        comparison_rows.append({
+            "Label":          label,
+            "Commit Key":     "",
+            "PRIVV Total":    0.0,
+            "eBuilder Total": amount,
+            "Delta":          amount,
+            "eB Matches":     1,
+            "Status":         "❓ Unmatched (needs review)",
+            "_eb_entries":    [dict(eb_row)],
+            "_prv_entries":   [],
+        })
+        inv_log(f"    No match found (not PSU) → new unmatched entry '{label}': "
+                f"Invoice #{eb_row.get('Invoice #','')} | ${amount:,.2f}")
+
+    # ── Handle unmatched eBuilder rows ────────────────────────────────────────
+    unmatched_eb = eb_inv[~eb_inv.index.isin(all_matched_eb_indices)].copy()
+    inv_log(f"\n  Unmatched eBuilder invoice rows (no Commitment # match): {len(unmatched_eb)}")
+
+    fuzzy_buckets: dict = {}  # normalized vendor name -> {label, rows}
+    psu_fallback:  list = []  # rows that pass the Penn/date heuristic -> PSU OPP
+    new_company_rows: list = []  # rows that match nothing at all -> own line item
+
+    for _, eb_row in unmatched_eb.iterrows():
+        vendor_hit = _alias_find_prv_vendor(eb_row) or _fuzzy_find_prv_vendor(eb_row)
+        if vendor_hit:
+            vk = normalize(vendor_hit)
+            fuzzy_buckets.setdefault(vk, {"label": vendor_hit, "rows": []})
+            fuzzy_buckets[vk]["rows"].append(eb_row)
+            inv_log(f"    Fuzzy match to '{vendor_hit}': "
+                    f"Invoice #{eb_row.get('Invoice #','')} | "
+                    f"{eb_row.get('Company','')} | "
+                    f"${float(eb_row['_amount_num']):,.2f}")
+            continue
+
+        # No vendor match — only route to PSU OPP if it actually looks like
+        # PSU OPP (Penn keyword in Company/Description, or a date PRIVV
+        # logged against PSU OPP). Otherwise it's a genuinely new/unmatched
+        # row and should be visible as its own line, not folded into PSU.
+        company_str = str(eb_row.get("Company", ""))
+        desc_str    = str(eb_row.get("Description", ""))
+        # Word-level match (not raw substring) so short tokens like "psu"
+        # don't false-positive on unrelated words.
+        psu_tokens = set(normalize(company_str).split()) | set(normalize(desc_str).split())
+        penn_in_text = bool(psu_tokens & {"penn", "psu"})
+        date_matches = (eb_date_col is not None and
+                        _eb_inv_date_matches_psu(eb_row.get(eb_date_col, "")))
+
+        if penn_in_text or date_matches:
+            reason = []
+            if penn_in_text: reason.append("'Penn'/'PSU' keyword in Company/Description")
+            if date_matches: reason.append("date matches PSU OPP PRIVV entry")
+            inv_log(f"    {' & '.join(reason)} → PSU OPP: "
+                    f"Invoice #{eb_row.get('Invoice #','')}")
+            psu_fallback.append(eb_row)
+        else:
+            new_company_rows.append(eb_row)
+
+    # Merge fuzzy-matched rows into their matching comparison_row
+    for vk, bucket in fuzzy_buckets.items():
+        vendor_label = bucket["label"]
+        rows_list    = bucket["rows"]
+        fuzzy_amount = sum(float(r["_amount_num"]) for r in rows_list)
+        n_rows       = len(rows_list)
+        existing = next(
+            (r for r in comparison_rows if normalize(r["Label"]) == vk),
+            None,
+        )
+        if existing:
+            existing["eBuilder Total"] += fuzzy_amount
+            existing["eB Matches"]     += n_rows
+            existing["_eb_entries"].extend([dict(r) for r in rows_list])
+            existing["Delta"]  = existing["eBuilder Total"] - existing["PRIVV Total"]
+            existing["Status"] = (
+                "✅ Match"           if abs(existing["Delta"]) < 0.01 else
+                "🔼 eBuilder Higher" if existing["eBuilder Total"] > existing["PRIVV Total"] else
+                "🔽 eBuilder Lower"
+            )
+        else:
+            # Fuzzy matched a vendor name not yet in comparison_rows — add it
+            comparison_rows.append({
+                "Label":          vendor_label,
+                "Commit Key":     "",
+                "PRIVV Total":    0.0,
+                "eBuilder Total": fuzzy_amount,
+                "Delta":          fuzzy_amount,
+                "eB Matches":     n_rows,
+                "Status":         "🔼 eBuilder Higher",
+                "_eb_entries":    [dict(r) for r in rows_list],
+                "_prv_entries":   [],
+            })
+
+    # Rows that couldn't be matched by Commitment # OR fuzzy, but DO look like
+    # PSU OPP (Penn keyword / date match) -> Penn State OPP
+    if psu_fallback:
+        inv_log(f"\n  {len(psu_fallback)} invoice row(s) matched PSU OPP "
+                f"via Penn keyword / date heuristic:")
+        _add_to_inv_psu(psu_fallback, "Penn keyword/date match")
+
+    # Rows that couldn't be matched at all AND don't look like PSU OPP ->
+    # their own line item so they're visible for review instead of being
+    # silently absorbed into Penn State OPP.
+    if new_company_rows:
+        inv_log(f"\n  {len(new_company_rows)} invoice row(s) genuinely unmatched "
+                f"-> flagged as new/unmatched entries:")
+        for eb_row in new_company_rows:
+            _add_to_new_inv_company(eb_row)
+
+    # ── Merge duplicate company entries into one row ──────────────────────────
+    # Any two rows with the same normalized Label get collapsed: amounts are
+    # summed, entry lists are combined, and status is recomputed.
+    merged: list = []
+    seen_labels: dict = {}  # normalized label -> index in merged
+    for r in comparison_rows:
+        nk = normalize(r["Label"])
+        if nk in seen_labels:
+            m = merged[seen_labels[nk]]
+            m["PRIVV Total"]    += r["PRIVV Total"]
+            m["eBuilder Total"] += r["eBuilder Total"]
+            m["eB Matches"]     += r["eB Matches"]
+            m["_eb_entries"].extend(r.get("_eb_entries", []))
+            m["_prv_entries"].extend(r.get("_prv_entries", []))
+            m["Delta"]  = m["eBuilder Total"] - m["PRIVV Total"]
+            m["Status"] = (
+                "✅ Match"               if abs(m["Delta"]) < 0.01 else
+                "🔼 eBuilder Higher" if m["eBuilder Total"] > m["PRIVV Total"] else
+                "🔽 eBuilder Lower"
+            )
+        else:
+            seen_labels[nk] = len(merged)
+            merged.append(dict(r))
+    comparison_rows = merged
+
+    comparison_rows.sort(key=lambda r: abs(r["Delta"]), reverse=True)
+
+    total_eb  = sum(r["eBuilder Total"] for r in comparison_rows)
+    total_prv = sum(r["PRIVV Total"]    for r in comparison_rows)
+    total_d   = total_eb - total_prv
+    inv_log(f"\n  eBuilder Invoice Total : ${total_eb:,.2f}")
+    inv_log(f"  PRIVV Invoice Total    : ${total_prv:,.2f}")
+    inv_log(f"  Net Delta              : ${total_d:+,.2f}")
+    inv_log(f"\n  Comparison complete — {len(comparison_rows)} commitment(s) analyzed.")
+
+    show_invoice_comparison_window(comparison_rows, prv_inv)
+
+
+# ---------------------------------------------------------------------------
+# INVOICE RESULTS WINDOW
+# ---------------------------------------------------------------------------
+def show_invoice_comparison_window(rows, prv_inv_df):
+    win = tk.Toplevel(root)
+    win.title("Invoice Comparison: PRIVV vs eBuilder")
+    win.geometry("1100x560")
+
+    total_privv    = sum(r["PRIVV Total"]    for r in rows)
+    total_ebuilder = sum(r["eBuilder Total"] for r in rows)
+    total_delta    = total_ebuilder - total_privv
+    direction      = ("eBuilder is HIGHER" if total_delta > 0 else
+                      ("eBuilder is LOWER"  if total_delta < 0 else "Exact Match"))
+
+    summary_frame = tk.Frame(win, bg="#1e1e2e", padx=10, pady=6)
+    summary_frame.pack(fill="x")
+    tk.Label(
+        summary_frame,
+        text=(f"  PRIVV Total: ${total_privv:,.2f}     "
+              f"eBuilder Total: ${total_ebuilder:,.2f}     "
+              f"Net Delta: ${total_delta:+,.2f}     Overall: {direction}"),
+        bg="#1e1e2e", fg="white", font=("Consolas", 10, "bold"), anchor="w"
+    ).pack(fill="x")
+
+    search_frame = tk.Frame(win, padx=8, pady=4)
+    search_frame.pack(fill="x")
+    tk.Label(search_frame, text="Filter:").pack(side="left")
+    search_var = tk.StringVar()
+    tk.Entry(search_frame, textvariable=search_var, width=30).pack(side="left", padx=6)
+
+    cols = ("Vendor / Commitment", "PRIVV Total", "eBuilder Total", "Delta", "eB Invoices", "Status")
+    tree_frame = tk.Frame(win)
+    tree_frame.pack(fill="both", expand=True, padx=8, pady=4)
+
+    vsb = ttk.Scrollbar(tree_frame, orient="vertical")
+    hsb = ttk.Scrollbar(tree_frame, orient="horizontal")
+    tree = ttk.Treeview(
+        tree_frame, columns=cols, show="headings",
+        yscrollcommand=vsb.set, xscrollcommand=hsb.set, height=20
+    )
+    vsb.config(command=tree.yview)
+    hsb.config(command=tree.xview)
+
+    col_widths = {
+        "Vendor / Commitment": 340,
+        "PRIVV Total": 130, "eBuilder Total": 140,
+        "Delta": 130, "eB Invoices": 90, "Status": 160,
+    }
+    for c in cols:
+        tree.heading(c, text=c)
+        tree.column(c, width=col_widths.get(c, 120),
+                    anchor="e" if c not in ("Vendor / Commitment", "Status") else "w")
+
+    tree.tag_configure("match",  background="#d4edda")
+    tree.tag_configure("higher", background="#fff3cd")
+    tree.tag_configure("lower",  background="#f8d7da")
+    tree.tag_configure("nodata", background="#e2e3e5")
+
+    iid_to_row: dict = {}
+
+    def populate_tree(filter_text=""):
+        tree.delete(*tree.get_children())
+        iid_to_row.clear()
+        ft = filter_text.strip().lower()
+        for r in rows:
+            if ft and ft not in r["Label"].lower():
+                continue
+            tag = "nodata"
+            if "Match"  in r["Status"]:  tag = "match"
+            elif "Higher" in r["Status"]: tag = "higher"
+            elif "Lower"  in r["Status"]: tag = "lower"
+            iid = tree.insert("", "end", values=(
+                r["Label"],
+                f"${r['PRIVV Total']:,.2f}",
+                f"${r['eBuilder Total']:,.2f}",
+                f"${r['Delta']:+,.2f}",
+                r["eB Matches"],
+                r["Status"],
+            ), tags=(tag,))
+            iid_to_row[iid] = r
+
+    def show_inv_entries(event=None):
+        sel = tree.selection()
+        if not sel:
+            return
+        row = iid_to_row.get(sel[0])
+        if row is None:
+            return
+
+        eb_entries  = row.get("_eb_entries", [])
+        prv_entries = row.get("_prv_entries", [])
+
+        detail = tk.Toplevel(win)
+        detail.title(f"Invoice Entries — {row['Label']}")
+        detail.geometry("1300x520")
+
+        hdr = tk.Frame(detail, bg="#1e1e2e", padx=10, pady=6)
+        hdr.pack(fill="x")
+        tk.Label(
+            hdr,
+            text=(f"  {row['Label']}     "
+                  f"eBuilder Total: ${row['eBuilder Total']:,.2f}     "
+                  f"PRIVV Total: ${row['PRIVV Total']:,.2f}     "
+                  f"eB Invoices: {len(eb_entries)}     PRIVV Invoices: {len(prv_entries)}"),
+            bg="#1e1e2e", fg="white", font=("Consolas", 10, "bold"), anchor="w"
+        ).pack(fill="x")
+
+        nb = ttk.Notebook(detail)
+        nb.pack(fill="both", expand=True, padx=8, pady=6)
+
+        def _build_inv_tab(parent, entries, fallback_cols, label):
+            if entries:
+                tab_cols = []
+                seen = set()
+                for e in entries:
+                    for k in e.keys():
+                        if not str(k).startswith("_") and k not in seen:
+                            seen.add(k)
+                            tab_cols.append(k)
+            else:
+                tab_cols = list(fallback_cols)
+
+            f = tk.Frame(parent)
+            f.pack(fill="both", expand=True, padx=8, pady=6)
+            evsb = ttk.Scrollbar(f, orient="vertical")
+            ehsb = ttk.Scrollbar(f, orient="horizontal")
+            etree = ttk.Treeview(f, columns=tab_cols, show="headings",
+                                  yscrollcommand=evsb.set, xscrollcommand=ehsb.set, height=16)
+            evsb.config(command=etree.yview)
+            ehsb.config(command=etree.xview)
+            money = {"Invoice Amount", "Amount", "_amount_num"}
+            for c in tab_cols:
+                etree.heading(c, text=c)
+                etree.column(c, width=150, anchor="e" if c in money else "w")
+            if entries:
+                for e in entries:
+                    etree.insert("", "end", values=tuple(e.get(c, "") for c in tab_cols))
+            else:
+                etree.insert("", "end", values=(label,) + ("",) * (len(tab_cols) - 1))
+            evsb.pack(side="right", fill="y")
+            ehsb.pack(side="bottom", fill="x")
+            etree.pack(fill="both", expand=True)
+
+        eb_tab_frame  = tk.Frame(nb)
+        prv_tab_frame = tk.Frame(nb)
+        nb.add(eb_tab_frame,  text=f"eBuilder Invoices ({len(eb_entries)})")
+        nb.add(prv_tab_frame, text=f"PRIVV Invoices ({len(prv_entries)})")
+
+        _build_inv_tab(eb_tab_frame,  eb_entries,  ["Invoice #", "Description", "Company", "Commitment #", "Invoice Amount"], "(No eBuilder entries)")
+        _build_inv_tab(prv_tab_frame, prv_entries, list(prv_inv_df.columns), "(No PRIVV entries)")
+
+        tk.Button(detail, text="Close", command=detail.destroy, padx=10).pack(pady=6)
+
+    tree.bind("<Double-1>", show_inv_entries)
+    populate_tree()
+    search_var.trace_add("write", lambda *_: populate_tree(search_var.get()))
+
+    vsb.pack(side="right",  fill="y")
+    hsb.pack(side="bottom", fill="x")
+    tree.pack(fill="both", expand=True)
+
+    tk.Label(win, text="💡 Double-click any row to view its individual invoice entries",
+             fg="#555", font=("Segoe UI", 9, "italic")).pack(pady=(0, 2))
+
+    legend = tk.Frame(win, padx=8, pady=4)
+    legend.pack(fill="x")
+    for color, lbl in [
+        ("#d4edda", "✅ Match"),
+        ("#fff3cd", "🔼 eBuilder Higher"),
+        ("#f8d7da", "🔽 eBuilder Lower"),
+        ("#e2e3e5", "⚪ No Data"),
+    ]:
+        tk.Label(legend, text=f"  {lbl}  ", bg=color, relief="solid",
+                 bd=1, padx=6, pady=2).pack(side="left", padx=4)
+
+    # ── Export invoice comparison to Excel ───────────────────────────────────
+    def export_invoice_comparison():
+        path = filedialog.asksaveasfilename(
+            defaultextension=".xlsx",
+            filetypes=[("Excel Files", "*.xlsx")],
+            title="Save invoice comparison as..."
+        )
+        if not path:
+            return
+
+        HEADER_FILL = PatternFill("solid", start_color="1E1E2E", end_color="1E1E2E")
+        HEADER_FONT = Font(name="Calibri", bold=True, color="FFFFFF")
+        BASE_FONT   = Font(name="Calibri")
+        THIN        = Side(style="thin", color="D9D9D9")
+        BORDER      = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
+        STATUS_FILL = {
+            "✅ Match":           "C6EFCE",
+            "🔼 eBuilder Higher": "FFEB9C",
+            "🔽 eBuilder Lower":  "FFC7CE",
+            "⚪ No Data":          "E2E3E5",
+        }
+
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Invoice Summary"
+        headers = ["Vendor / Commitment", "eBuilder Total", "PRIVV Total", "Delta", "Status", "eB Invoices"]
+        for c, h in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=c, value=h)
+            cell.font = HEADER_FILL and HEADER_FONT
+            cell.fill = HEADER_FILL
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+        ws.freeze_panes = "A2"
+
+        money_cols = {2, 3, 4}
+        for r_idx, r in enumerate(rows, start=2):
+            values = [
+                r["Label"],
+                r["eBuilder Total"], r["PRIVV Total"], r["Delta"],
+                r["Status"], r["eB Matches"],
+            ]
+            fill = PatternFill("solid", start_color=STATUS_FILL.get(r["Status"], "FFFFFF"))
+            for c_idx, val in enumerate(values, 1):
+                cell = ws.cell(row=r_idx, column=c_idx, value=val)
+                cell.font  = BASE_FONT
+                cell.border = BORDER
+                cell.fill  = fill
+                if c_idx in money_cols:
+                    cell.number_format = '$#,##0.00;($#,##0.00);"-"'
+
+        # eBuilder entries sheet
+        eb_sheet = wb.create_sheet("eBuilder Invoices")
+        eb_hdrs  = ["Vendor / Commitment", "Invoice #", "Description", "Company",
+                    "Commitment #", "Date Received", "Status", "Invoice Amount"]
+        for c, h in enumerate(eb_hdrs, 1):
+            cell = eb_sheet.cell(row=1, column=c, value=h)
+            cell.font = HEADER_FONT; cell.fill = HEADER_FILL
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+        eb_sheet.freeze_panes = "A2"
+        r_idx = 2
+        for r in rows:
+            for e in r.get("_eb_entries", []):
+                row_vals = [r["Label"]] + [e.get(h, "") for h in eb_hdrs[1:]]
+                for c_idx, val in enumerate(row_vals, 1):
+                    cell = eb_sheet.cell(row=r_idx, column=c_idx, value=val)
+                    cell.font = BASE_FONT; cell.border = BORDER
+                r_idx += 1
+
+        # PRIVV entries sheet
+        prv_sheet = wb.create_sheet("PRIVV Invoices")
+        prv_cols  = [c for c in prv_inv_df.columns if not str(c).startswith("_")]
+        prv_hdrs  = ["Vendor / Commitment"] + prv_cols
+        for c, h in enumerate(prv_hdrs, 1):
+            cell = prv_sheet.cell(row=1, column=c, value=h)
+            cell.font = HEADER_FONT; cell.fill = HEADER_FILL
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+        prv_sheet.freeze_panes = "A2"
+        r_idx = 2
+        for r in rows:
+            for e in r.get("_prv_entries", []):
+                row_vals = [r["Label"]] + [e.get(col, "") for col in prv_cols]
+                for c_idx, val in enumerate(row_vals, 1):
+                    cell = prv_sheet.cell(row=r_idx, column=c_idx, value=val)
+                    cell.font = BASE_FONT; cell.border = BORDER
+                r_idx += 1
+
+        wb.save(path)
+        messagebox.showinfo("Exported", f"Saved to:\n{path}", parent=win)
+
+    tk.Button(win, text="Export to Excel", command=export_invoice_comparison,
+              bg="#0066cc", fg="white", padx=8).pack(pady=6)
+
+
+# ── Invoice tab buttons / log ────────────────────────────────────────────────
+tk.Button(
+    inv_btn_frame, text="Compare Invoices", command=run_invoice_comparison,
+    bg="#0066cc", fg="white", width=18, padx=6
+).pack(side="left", padx=8)
+
+inv_output_box = tk.Text(inv_tab, height=18, width=100)
+inv_output_box.pack(pady=10, padx=10)
 
 root.mainloop()
 
 
-#06/24/2026 Current code handles debugging and display unaccounted for rows. question is how ot minimize un accounted for rows
+#06/24/2026 Handles the budget part of the porogram
 
 
-#06/24/2026 Current code handles debugging and display unaccounted for rows. question is how ot minimize un accounted for rows
+#6.28.2026 working on invoice part of the program
+
+#6/30/2026 Invoices does sum i need to double check the accuracy of the program hopefully it
