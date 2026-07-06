@@ -2,13 +2,133 @@ import os
 import pandas as pd
 import re
 import tkinter as tk
+import git  
+from git import Repo  
 from tkinter import filedialog, messagebox, ttk
 from rapidfuzz import fuzz, process
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
+# ── Google Sheets (vendor alias) integration ─────────────────────────────────
+# Same concept as tt.py: a shared Google Sheet lets any user add a
+# "Vendor Name -> Alias" pair from the GUI, and every run of this program
+# reads that sheet back in so the classifier/matcher knows about it too.
+try:
+    from google.oauth2.service_account import Credentials
+    import gspread
+    GSPREAD_AVAILABLE = True
+except ImportError:
+    GSPREAD_AVAILABLE = False
+
+GOOGLE_SHEET_NAME  = "learned_rules"     # same spreadsheet used by tt.py
+ALIAS_TAB_NAME     = "VendorAliases"     # new tab inside that spreadsheet
+ALIAS_TAB_HEADERS  = ["Vendor", "Alias"]
+CREDS_FILE         = "credentials.json"  # path to your downloaded service-account JSON key
+
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+
+_gsheet_client = None  # cached gspread client
+
+
+def get_gsheet_client():
+    """Return a cached, authorized gspread client, or None if Sheets access
+    isn't available (missing library or missing credentials.json)."""
+    global _gsheet_client
+    if not GSPREAD_AVAILABLE:
+        return None
+    if _gsheet_client is not None:
+        return _gsheet_client
+    if not os.path.exists(CREDS_FILE):
+        return None
+    try:
+        creds = Credentials.from_service_account_file(CREDS_FILE, scopes=SCOPES)
+        _gsheet_client = gspread.authorize(creds)
+        return _gsheet_client
+    except Exception as e:
+        print(f"[VendorAliases] Could not authorize Google Sheets client: {e}")
+        return None
+
+
+def get_alias_worksheet():
+    """Return the 'VendorAliases' worksheet inside the shared spreadsheet,
+    creating it (with headers) if it doesn't exist yet. Returns None if
+    Sheets access isn't available."""
+    client = get_gsheet_client()
+    if client is None:
+        return None
+    try:
+        spreadsheet = client.open(GOOGLE_SHEET_NAME)
+    except Exception as e:
+        print(f"[VendorAliases] Could not open spreadsheet '{GOOGLE_SHEET_NAME}': {e}")
+        return None
+
+    try:
+        ws = spreadsheet.worksheet(ALIAS_TAB_NAME)
+    except gspread.exceptions.WorksheetNotFound:
+        ws = spreadsheet.add_worksheet(title=ALIAS_TAB_NAME, rows=1000, cols=2)
+        ws.append_row(ALIAS_TAB_HEADERS)
+    except Exception as e:
+        print(f"[VendorAliases] Could not access tab '{ALIAS_TAB_NAME}': {e}")
+        return None
+    return ws
+
+
+# In-memory copy of everything currently in the VendorAliases sheet tab,
+# keyed lowercase like VENDOR_ALIASES so resolve_alias() can consult both.
+SHEET_VENDOR_ALIASES = {}
+
+def load_vendor_aliases_from_sheet():
+    """Pull every Vendor/Alias row from the Google Sheet tab into
+    SHEET_VENDOR_ALIASES. Safe to call even if Sheets isn't configured
+    (just leaves the dict empty/unchanged). Returns the dict."""
+    global SHEET_VENDOR_ALIASES
+    ws = get_alias_worksheet()
+    if ws is None:
+        return SHEET_VENDOR_ALIASES
+    try:
+        records = ws.get_all_records()  # list of {"Vendor": ..., "Alias": ...}
+    except Exception as e:
+        print(f"[VendorAliases] Could not read rows: {e}")
+        return SHEET_VENDOR_ALIASES
+
+    fresh = {}
+    for row in records:
+        vendor = str(row.get("Vendor", "")).strip()
+        alias  = str(row.get("Alias", "")).strip()
+        if not vendor or not alias:
+            continue
+        fresh[vendor.lower()] = alias
+    SHEET_VENDOR_ALIASES = fresh
+    return SHEET_VENDOR_ALIASES
+
+
+def add_vendor_alias_to_sheet(vendor: str, alias: str):
+    """Append a new Vendor/Alias row to the shared sheet and update the
+    in-memory SHEET_VENDOR_ALIASES immediately so it's usable without a
+    restart. Raises an exception on failure so the caller (GUI) can show it."""
+    vendor = vendor.strip()
+    alias  = alias.strip()
+    if not vendor or not alias:
+        raise ValueError("Both Vendor Name and Alias are required.")
+
+    ws = get_alias_worksheet()
+    if ws is None:
+        raise RuntimeError(
+            "Google Sheets isn't available. Make sure 'gspread' and "
+            "'google-auth' are installed and credentials.json is present."
+        )
+    ws.append_row([vendor, alias])
+    SHEET_VENDOR_ALIASES[vendor.lower()] = alias
+
+
 OUTPUT_FILE = "privv_importable.csv"
+
+
+
 
 ITEM_MAP = {
     "102": "Project Feasibility Analysis",
@@ -251,6 +371,19 @@ def normalize(text):
 # it's ever too loose/strict across the whole PRIVV file.
 PRIVV_VENDOR_FUZZY_THRESHOLD = 87
 
+# PRIVV "generic bucket" vendor labels — rows logged under one of these
+# Vendor values don't identify the real company on the Vendor field itself,
+# so the Description-embedded-name fallback in find_fuzzy_privv_matches is
+# only meaningful for THESE rows. Any row whose Vendor field already names a
+# specific, real vendor (e.g. "Populous") must stay attributed to that vendor
+# even if its Description happens to start with some other vendor's name
+# (e.g. a "HRG Civil Design" line item billed under Populous). This is not a
+# per-vendor keyword list — it's the one already-established generic-bucket
+# concept (Penn State OPP) used elsewhere in this file (see psu_privv_key /
+# PSU_OPP_LABEL), kept in one place so it can be extended if another true
+# generic bucket ever shows up in PRIVV data.
+GENERIC_BUCKET_VENDORS = {"penn state office of physical plant"}
+
 
 def find_fuzzy_privv_matches(vendor_label: str, privv_df, threshold: int = PRIVV_VENDOR_FUZZY_THRESHOLD):
     """Return every PRIVV row whose Vendor field is the same company as
@@ -309,14 +442,22 @@ def find_fuzzy_privv_matches(vendor_label: str, privv_df, threshold: int = PRIVV
         return dn.startswith(target)
 
     def _is_match(row):
-        if has_vendor and _vendor_match(normalize(str(row.get("Vendor", "")))):
+        row_vendor_norm = normalize(str(row.get("Vendor", ""))) if has_vendor else ""
+        if has_vendor and _vendor_match(row_vendor_norm):
             return True
-        # Also check Description — PRIVV sometimes logs a generic bucket like
-        # "Penn State Office of Physical Plant" as Vendor and puts the real
-        # company name at the start of Description (e.g. "Dobil Laboratories
-        # Inc - TV monitors purchased...").
-        if has_desc and _desc_match(normalize(str(row.get("Description", "")))):
-            return True
+        # Also check Description — but ONLY for rows whose own Vendor field
+        # is blank or is a known generic bucket (e.g. "Penn State Office of
+        # Physical Plant"). If the row already has a specific, real vendor
+        # in its Vendor field (e.g. "Populous"), that field is authoritative
+        # and must not be overridden just because the Description happens to
+        # start with some other vendor's name (e.g. a "HRG Civil Design"
+        # line item billed under Populous). Without this guard, every real
+        # vendor's line items are at risk of being double-counted into any
+        # other vendor whose name happens to appear at the start of a
+        # description.
+        if has_desc and (not row_vendor_norm or row_vendor_norm in GENERIC_BUCKET_VENDORS):
+            if _desc_match(normalize(str(row.get("Description", "")))):
+                return True
         return False
 
     mask = privv_df.apply(_is_match, axis=1)
@@ -327,6 +468,16 @@ def resolve_alias(vendor_raw: str):
     key = vendor_raw.strip().lower()
     if not key:
         return vendor_raw
+
+    # User-added aliases (from the Vendor Aliases tab / Google Sheet) take
+    # priority over the hardcoded VENDOR_ALIASES map, since they're the
+    # most recently/explicitly taught mapping.
+    if key in SHEET_VENDOR_ALIASES:
+        return SHEET_VENDOR_ALIASES[key]
+    for alias_key, canonical in SHEET_VENDOR_ALIASES.items():
+        if alias_key and (alias_key in key or key in alias_key):
+            return canonical
+
     if key in VENDOR_ALIASES:
         return VENDOR_ALIASES[key]
     for alias_key, canonical in VENDOR_ALIASES.items():
@@ -1112,6 +1263,43 @@ def run_comparison():
     log("────────────────────────────────────────────────────────────────────────\n")
     # ── END DEBUG ─────────────────────────────────────────────────────────────
 
+    # ── TRUE POST-MATCHING TOTALS (de-duplicated) ────────────────────────────
+    # "eBuilder Total" on each comparison row is a per-vendor subtotal. The
+    # substring/alias matching used above can occasionally match the same
+    # eBuilder row into two different vendors' totals, which inflates the
+    # sum of those subtotals. claimed_ids (built above) is the distinct set
+    # of eBuilder IDs that ended up counted anywhere, so re-summing eb_raw
+    # filtered to just those ids gives the real, de-duped eBuilder total —
+    # each eBuilder row counted once no matter how many vendors claimed it.
+    naive_eb_sum    = sum(r["eBuilder Total"] for r in comparison_rows)
+    naive_privv_sum = sum(r["PRIVV Total"]    for r in comparison_rows)
+
+    if "ID" in eb_raw.columns:
+        true_eb_total = eb_raw.loc[
+            eb_raw["ID"].astype(str).str.strip().isin(claimed_ids), "_commit_num"
+        ].sum()
+    else:
+        true_eb_total = naive_eb_sum  # no unique ID column available to de-dupe against
+
+    # PRIVV totals are pulled per vendor by an exact-equality mask on a
+    # unique vendor_key, so they shouldn't double count the way eBuilder can —
+    # but sum straight from privv_df too so the "true" totals are always
+    # calculated the same way: from the source data, not from subtotals.
+    true_privv_total = privv_df["_amount_num"].sum()
+
+    log("\n── TRUE POST-MATCHING TOTALS (de-duplicated) ───────────────────────────")
+    log(f"  eBuilder Total (sum of per-vendor subtotals) : ${naive_eb_sum:,.2f}")
+    log(f"  eBuilder Total (true, de-duped by ID)        : ${true_eb_total:,.2f}")
+    if abs(naive_eb_sum - true_eb_total) > 0.01:
+        log(f"  ⚠ Difference of ${naive_eb_sum - true_eb_total:,.2f} — some eBuilder "
+            f"entries were counted under more than one company above.")
+    log(f"  PRIVV Total    (sum of per-vendor subtotals) : ${naive_privv_sum:,.2f}")
+    log(f"  PRIVV Total    (true, all PRIVV rows loaded)  : ${true_privv_total:,.2f}")
+    if abs(naive_privv_sum - true_privv_total) > 0.01:
+        log(f"  ⚠ Difference of ${naive_privv_sum - true_privv_total:,.2f} between PRIVV "
+            f"rows attributed to a vendor and all PRIVV rows loaded.")
+    log("────────────────────────────────────────────────────────────────────────\n")
+
     show_comparison_window(comparison_rows, privv_df)
     log(f"Comparison complete — {len(comparison_rows)} vendor(s) analyzed.")
 
@@ -1691,6 +1879,16 @@ def run_invoice_comparison():
     eb_inv  = pd.read_csv(invoice_eb_file,    dtype=str).fillna("")
     prv_inv = pd.read_csv(invoice_privv_file, dtype=str).fillna("")
 
+    # Give every source row a stable, unique id BEFORE any matching happens.
+    # Rows can legitimately get copied into more than one comparison row's
+    # _eb_entries/_prv_entries during matching (Commitment # match, then
+    # fuzzy fallback, then PSU OPP fallback, etc.), which double counts the
+    # row's dollar amount if you just add up each comparison row's subtotal.
+    # These ids let us de-dupe back down to "each source row counted once"
+    # for the true post-matching totals computed further below.
+    eb_inv["_uid"]  = range(len(eb_inv))
+    prv_inv["_uid"] = range(len(prv_inv))
+
     # ── Validate required columns ─────────────────────────────────────────────
     eb_required  = {"Commitment #", "Invoice Amount"}
     prv_required = {"Vendor #", "Amount"}
@@ -2109,6 +2307,51 @@ def run_invoice_comparison():
     inv_log(f"\n  eBuilder Invoice Total : ${total_eb:,.2f}")
     inv_log(f"  PRIVV Invoice Total    : ${total_prv:,.2f}")
     inv_log(f"  Net Delta              : ${total_d:+,.2f}")
+
+    # ── TRUE POST-MATCHING TOTALS (de-duplicated) ────────────────────────────
+    # total_eb / total_prv above are sums of each comparison row's subtotal.
+    # If the rare "same entry landed under two companies" bug fires, a
+    # source row can be present in more than one row's _eb_entries /
+    # _prv_entries, and that sum will double count it. Re-derive the totals
+    # here by walking every entry once we've collected them ALL (matching is
+    # fully done at this point) and keeping only the first copy of each
+    # source row's _uid, so these numbers reflect the actual dollars in the
+    # two source files regardless of how matching routed them.
+    seen_eb_uids: set = set()
+    true_eb_total = 0.0
+    dup_eb_count = 0
+    for r in comparison_rows:
+        for entry in r.get("_eb_entries", []):
+            uid = entry.get("_uid")
+            if uid in seen_eb_uids:
+                dup_eb_count += 1
+                continue
+            seen_eb_uids.add(uid)
+            true_eb_total += float(entry.get("_amount_num", 0) or 0)
+
+    seen_prv_uids: set = set()
+    true_prv_total = 0.0
+    dup_prv_count = 0
+    for r in comparison_rows:
+        for entry in r.get("_prv_entries", []):
+            uid = entry.get("_uid")
+            if uid in seen_prv_uids:
+                dup_prv_count += 1
+                continue
+            seen_prv_uids.add(uid)
+            true_prv_total += float(entry.get("_amount_num", 0) or 0)
+
+    inv_log(f"\n  TRUE eBuilder Total (deduped) : ${true_eb_total:,.2f}")
+    if dup_eb_count:
+        inv_log(f"    ⚠ {dup_eb_count} eBuilder entry instance(s) were counted under "
+                f"more than one company — excluded from the true total above.")
+    inv_log(f"  TRUE PRIVV Total    (deduped) : ${true_prv_total:,.2f}")
+    if dup_prv_count:
+        inv_log(f"    ⚠ {dup_prv_count} PRIVV entry instance(s) were counted under "
+                f"more than one company — excluded from the true total above.")
+    if abs(true_eb_total - total_eb) > 0.01 or abs(true_prv_total - total_prv) > 0.01:
+        inv_log(f"  TRUE Net Delta                : ${true_eb_total - true_prv_total:+,.2f}")
+
     inv_log(f"\n  Comparison complete — {len(comparison_rows)} commitment(s) analyzed.")
 
     show_invoice_comparison_window(comparison_rows, prv_inv)
@@ -2389,6 +2632,114 @@ tk.Button(
 
 inv_output_box = tk.Text(inv_tab, height=18, width=100)
 inv_output_box.pack(pady=10, padx=10)
+
+# ════════════════════════════════════════════════════════════════════════════
+# TAB 3 — VENDOR ALIASES  (shared Google Sheet, same concept as tt.py)
+# ════════════════════════════════════════════════════════════════════════════
+alias_tab = tk.Frame(notebook)
+notebook.add(alias_tab, text="Vendor Aliases")
+
+tk.Label(
+    alias_tab,
+    text="Vendor Name -> Alias mappings live in the shared Google Sheet "
+         f"('{GOOGLE_SHEET_NAME}' -> '{ALIAS_TAB_NAME}' tab). Anything added "
+         "here is used immediately by both the Comparisons and Invoices tabs.",
+    fg="#555", wraplength=760, justify="left", anchor="w",
+).pack(pady=(10, 4), padx=10, fill="x")
+
+alias_status_label = tk.Label(alias_tab, text="", fg="gray", anchor="w")
+alias_status_label.pack(padx=10, fill="x")
+
+alias_form = tk.Frame(alias_tab)
+alias_form.pack(pady=8, padx=10, fill="x")
+
+tk.Label(alias_form, text="Vendor Name:").grid(row=0, column=0, sticky="w", padx=4, pady=4)
+alias_vendor_entry = tk.Entry(alias_form, width=40)
+alias_vendor_entry.grid(row=0, column=1, padx=4, pady=4, sticky="w")
+
+tk.Label(alias_form, text="Alias:").grid(row=0, column=2, sticky="w", padx=4, pady=4)
+alias_alias_entry = tk.Entry(alias_form, width=40)
+alias_alias_entry.grid(row=0, column=3, padx=4, pady=4, sticky="w")
+
+alias_tree_frame = tk.Frame(alias_tab)
+alias_tree_frame.pack(pady=6, padx=10, fill="both", expand=True)
+
+alias_tree = ttk.Treeview(
+    alias_tree_frame, columns=("vendor", "alias"), show="headings", height=16
+)
+alias_tree.heading("vendor", text="Vendor Name")
+alias_tree.heading("alias", text="Alias")
+alias_tree.column("vendor", width=340, anchor="w")
+alias_tree.column("alias", width=340, anchor="w")
+alias_tree.pack(side="left", fill="both", expand=True)
+
+alias_scroll = ttk.Scrollbar(alias_tree_frame, orient="vertical", command=alias_tree.yview)
+alias_tree.configure(yscroll=alias_scroll.set)
+alias_scroll.pack(side="right", fill="y")
+
+
+def refresh_alias_tree():
+    """Reload SHEET_VENDOR_ALIASES from Google Sheets and repopulate the table."""
+    alias_status_label.config(text="Loading vendor aliases from Google Sheet...", fg="gray")
+    alias_tab.update_idletasks()
+    load_vendor_aliases_from_sheet()
+
+    for row in alias_tree.get_children():
+        alias_tree.delete(row)
+    for vendor_lower, alias in sorted(SHEET_VENDOR_ALIASES.items()):
+        alias_tree.insert("", "end", values=(vendor_lower, alias))
+
+    if not GSPREAD_AVAILABLE:
+        alias_status_label.config(
+            text="gspread / google-auth not installed - vendor aliases are local-only until installed.",
+            fg="#b36b00",
+        )
+    elif not os.path.exists(CREDS_FILE):
+        alias_status_label.config(
+            text=f"'{CREDS_FILE}' not found - add your service-account key to enable the shared sheet.",
+            fg="#b36b00",
+        )
+    else:
+        alias_status_label.config(
+            text=f"Loaded {len(SHEET_VENDOR_ALIASES)} alias(es) from '{GOOGLE_SHEET_NAME}' -> '{ALIAS_TAB_NAME}'.",
+            fg="green",
+        )
+
+
+def add_alias_clicked():
+    vendor = alias_vendor_entry.get().strip()
+    alias  = alias_alias_entry.get().strip()
+    if not vendor or not alias:
+        messagebox.showwarning("Missing info", "Please enter both a Vendor Name and an Alias.", parent=alias_tab)
+        return
+    try:
+        add_vendor_alias_to_sheet(vendor, alias)
+    except Exception as e:
+        messagebox.showerror("Could not save alias", str(e), parent=alias_tab)
+        return
+    alias_vendor_entry.delete(0, tk.END)
+    alias_alias_entry.delete(0, tk.END)
+    refresh_alias_tree()
+    messagebox.showinfo("Saved", f"'{vendor}' -> '{alias}' added to the shared sheet.", parent=alias_tab)
+
+
+alias_btn_frame = tk.Frame(alias_tab)
+alias_btn_frame.pack(pady=(0, 10), padx=10, fill="x")
+
+tk.Button(
+    alias_btn_frame, text="Add Alias", command=add_alias_clicked,
+    bg="#0066cc", fg="white", width=14, padx=6
+).pack(side="left", padx=4)
+
+tk.Button(
+    alias_btn_frame, text="Refresh from Sheet", command=refresh_alias_tree,
+    width=16, padx=6
+).pack(side="left", padx=4)
+
+# Load whatever is already in the sheet as soon as the app starts, so
+# resolve_alias() has the latest user-taught mappings from the very first
+# comparison/invoice run - not just after visiting this tab.
+refresh_alias_tree()
 
 root.mainloop()
 
