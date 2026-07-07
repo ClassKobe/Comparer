@@ -27,10 +27,13 @@ This tool helps financial teams:
   - `openpyxl` - Excel file handling
   - `rapidfuzz` - Fuzzy string matching
   - `tkinter` - GUI (usually included with Python)
+  - `gitpython` - GUI (usually included with Python)
+ 
+  - WHEN INSTALLING PYTHON ADD PYTHON.EXE TO PATH ELSE YOU WILL MANUALLY HAVE TO ADD YOUR FILE TO PATH (THIS IS DIFFICULT IF YOU MESS UP UNINSTALL PYTHON AND TRY AGAIN)
 
 ## Installation
 ```bash
-pip install pandas gitpython rapidfuzz openpyxl```
+pip install pandas gitpython rapidfuzz openpyxl gitpython```
 
 ## How to Use
 
@@ -65,7 +68,22 @@ python python_file.py
    - Export results
 3. Monitor progress in the output box
 
-### Step 5: Review Output
+### Step 5: Run invoices 
+1. Click **"invoices tab then the big green button"**
+2. The program will:
+   - Load both files
+   - Apply classification rules (weighted)
+   - Perform fuzzy matching on unmatched items
+   - Group purchase orders
+   - Export results
+
+### Step 6: Vendor allias's 
+1. Type in the name of the vendor
+2. Type in the allias
+  -From here the code will read the google sheet next time you run it
+  -Allowing for the user to input allias's for vendors (Or if the code is being annoying you can input it however u please)
+
+### Step 7: Review Output
 The tool generates `privv_importable.csv` with the following columns:
 - **Code** - Cost code (e.g., 601, 708, 501)
 - **Vendor** - Company/vendor name
@@ -75,69 +93,6 @@ The tool generates `privv_importable.csv` with the following columns:
 - **Date Committed** - Formatted date
 - **Type** - "Change Order" or "Original"
 - **Amount** - Current commitment amount
-
-## Cost Code Mapping
-
-The tool recognizes 60+ cost codes organized by category:
-
-| Range | Category | Example Codes |
-|-------|----------|---------------|
-| 100-199 | Pre-Construction & Site | 102 (Feasibility), 107 (Environmental), 111 (Site Survey) |
-| 200-299 | Financing & Insurance | 201 (Financing), 202 (Insurance), 204 (Builders Risk) |
-| 300-399 | Project Management | 303 (PM), 308 (Testing), 310 (Commissioning) |
-| 400-499 | Architecture & Design | 401 (A/E), 408 (Geotechnical), 416 (Technology) |
-| 500-599 | Construction & Renovation | 501 (Pre-Const), 503.1 (West Side), 503.3 (Facility Work) |
-| 600-699 | Furnishings & Operations | 601 (Signage), 603 (Equipment), 604 (Facility Ops) |
-| 700-799 | Audio/Visual & Technology | 703 (Audio), 704 (Video), 712 (A/V), 713 (WIFI) |
-| 800-899 | Fees & Contingency | 802 (Impact Fees) |
-| 900-999 | Contingency | 901 (Owner Contingency) |
-
-## Classification Algorithm
-
-### Step 1: Weighted Rules (Priority-Based)
-The system applies 100+ hardcoded rules with weight thresholds:
-- **Weight 1000** - Highest priority (e.g., "Populous" always = 403)
-- **Weight 500** - High priority (e.g., "Internal Commitment" = 418)
-- **Weight 200** - Standard priority (most vendor/keyword rules)
-- **Weight 100-150** - Lower priority (generic keywords like "signage")
-
-Example rule structure:
-```
-{code: "403", weight: 1000, fields: ["vendor", "desc"], keywords: ["populous"], note: "..."}
-```
-
-### Step 2: Fuzzy Matching (Fallback)
-If no rules match, the system uses fuzzy matching:
-- Normalizes vendor names (lowercase, remove punctuation)
-- Uses `RapidFuzz` token_sort ratio (80%+ threshold)
-- Searches against normalized PRIVV lookup data
-- Records match confidence in "Match Note"
-
-### Step 3: Default Assignment
-- If neither rules nor fuzzy matching succeeds: defaults to **"999"** (Unmatched)
-- Unmatched rows are logged for manual review
-
-## Troubleshooting
-
-### Q: Many rows show code "999" (Unmatched)
-**A:** Add more rules for those vendors or update the PRIVV lookup file. Review unmatched rows in the console log.
-
-### Q: Fuzzy matching seems to miss obvious matches
-**A:** Check vendor name normalization. Some special characters are stripped. Verify PRIVV file has correct vendor names.
-
-### Q: PO grouping is combining unrelated items
-**A:** This is by design—the tool aggregates all POs by (Vendor, Cost Code). If you need finer granularity, modify the grouping logic around line 1527.
-
-### Q: Excel export has formatting issues
-**A:** Ensure openpyxl is properly installed: `pip install --upgrade openpyxl`
-
-## File Outputs
-
-| File | Description |
-|------|-------------|
-| `privv_importable.csv` | Main output, ready for PRIVV import |
-| `report_[timestamp].xlsx` | (Optional) Styled Excel report with highlighting |
-| Console/Log | Real-time processing status and unmatched entries |
 
 ## Advanced Features
 
