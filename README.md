@@ -30,8 +30,7 @@ This tool helps financial teams:
 
 ## Installation
 ```bash
-pip install pandas openpyxl rapidfuzz
-```
+pip install pandas gitpython rapidfuzz openpyxl```
 
 ## How to Use
 
