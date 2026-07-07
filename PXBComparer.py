@@ -176,6 +176,7 @@ ITEM_MAP = {
     "802": "Impact Fees",
     "901": "Owner Contingency",
     "316": "General Store / Grounds",
+    #"999": "Unclassified / Uncategorized"
 }
 
 CLASSIFICATION_RULES = [
@@ -1803,46 +1804,71 @@ inv_tab = tk.Frame(notebook)
 notebook.add(inv_tab, text="Invoices")
 
 # ── Invoice file state ───────────────────────────────────────────────────────
-invoice_eb_file:    str = ""
-invoice_privv_file: str = ""
+# Both sides now support selecting MULTIPLE files, which get concatenated
+# together when the comparison is run (same pattern as the budget tab's
+# ebuilder_files multi-select).
+invoice_eb_files:    list = []
+invoice_privv_files: list = []
 
 # ── File-picker helpers ──────────────────────────────────────────────────────
 inv_frame = tk.Frame(inv_tab)
 inv_frame.pack(pady=10, padx=10, fill="x")
 
-def select_invoice_eb_file():
-    global invoice_eb_file
-    f = filedialog.askopenfilename(
-        title="Select eBuilder Invoice CSV",
-        filetypes=[("CSV Files", "*.csv")]
-    )
-    if f:
-        invoice_eb_file = f
-        inv_eb_label.config(text=f"✅ {os.path.basename(f)}", fg="green")
+def _inv_eb_label_update():
+    if not invoice_eb_files:
+        inv_eb_label.config(text="No eBuilder invoice file(s) selected.", fg="gray")
+    elif len(invoice_eb_files) == 1:
+        inv_eb_label.config(text=f"✅ {os.path.basename(invoice_eb_files[0])}", fg="green")
     else:
-        if not invoice_eb_file:
-            inv_eb_label.config(text="No eBuilder invoice file selected.", fg="gray")
+        inv_eb_label.config(text=f"✅ {len(invoice_eb_files)} files selected", fg="green")
+
+def _inv_privv_label_update():
+    if not invoice_privv_files:
+        inv_privv_label.config(text="No PRIVV invoice file(s) selected.", fg="gray")
+    elif len(invoice_privv_files) == 1:
+        inv_privv_label.config(text=f"✅ {os.path.basename(invoice_privv_files[0])}", fg="green")
+    else:
+        inv_privv_label.config(text=f"✅ {len(invoice_privv_files)} files selected", fg="green")
+
+def select_invoice_eb_file():
+    global invoice_eb_files
+    files = list(filedialog.askopenfilenames(
+        title="Select eBuilder Invoice CSV file(s)",
+        filetypes=[("CSV Files", "*.csv")]
+    ))
+    if files:
+        invoice_eb_files = files
+    _inv_eb_label_update()
 
 def select_invoice_privv_file():
-    global invoice_privv_file
-    f = filedialog.askopenfilename(
-        title="Select PRIVV Invoice CSV",
+    global invoice_privv_files
+    files = list(filedialog.askopenfilenames(
+        title="Select PRIVV Invoice CSV file(s)",
         filetypes=[("CSV Files", "*.csv")]
-    )
-    if f:
-        invoice_privv_file = f
-        inv_privv_label.config(text=f"✅ {os.path.basename(f)}", fg="green")
-    else:
-        if not invoice_privv_file:
-            inv_privv_label.config(text="No PRIVV invoice file selected.", fg="gray")
+    ))
+    if files:
+        invoice_privv_files = files
+    _inv_privv_label_update()
 
-tk.Button(inv_frame, text="Select eBuilder Invoice File",  command=select_invoice_eb_file,    width=26).grid(row=0, column=0, padx=5, pady=4, sticky="w")
-inv_eb_label = tk.Label(inv_frame, text="No eBuilder invoice file selected.", fg="gray", anchor="w")
+def clear_invoice_eb_files():
+    global invoice_eb_files
+    invoice_eb_files = []
+    _inv_eb_label_update()
+
+def clear_invoice_privv_files():
+    global invoice_privv_files
+    invoice_privv_files = []
+    _inv_privv_label_update()
+
+tk.Button(inv_frame, text="Select eBuilder Invoice File(s)",  command=select_invoice_eb_file,    width=26).grid(row=0, column=0, padx=5, pady=4, sticky="w")
+inv_eb_label = tk.Label(inv_frame, text="No eBuilder invoice file(s) selected.", fg="gray", anchor="w")
 inv_eb_label.grid(row=0, column=1, padx=5, sticky="w")
+tk.Button(inv_frame, text="Clear", command=clear_invoice_eb_files, width=8, fg="red").grid(row=0, column=2, padx=5, sticky="w")
 
-tk.Button(inv_frame, text="Select PRIVV Invoice File", command=select_invoice_privv_file, width=26).grid(row=1, column=0, padx=5, pady=4, sticky="w")
-inv_privv_label = tk.Label(inv_frame, text="No PRIVV invoice file selected.", fg="gray", anchor="w")
+tk.Button(inv_frame, text="Select PRIVV Invoice File(s)", command=select_invoice_privv_file, width=26).grid(row=1, column=0, padx=5, pady=4, sticky="w")
+inv_privv_label = tk.Label(inv_frame, text="No PRIVV invoice file(s) selected.", fg="gray", anchor="w")
 inv_privv_label.grid(row=1, column=1, padx=5, sticky="w")
+tk.Button(inv_frame, text="Clear", command=clear_invoice_privv_files, width=8, fg="red").grid(row=1, column=2, padx=5, sticky="w")
 
 inv_btn_frame = tk.Frame(inv_tab)
 inv_btn_frame.pack(pady=4)
@@ -1863,21 +1889,56 @@ def normalize_commit_num(val: str) -> str:
 # ---------------------------------------------------------------------------
 # INVOICE COMPARISON LOGIC
 # ---------------------------------------------------------------------------
-def run_invoice_comparison():
-    global invoice_eb_file, invoice_privv_file
+def _drop_total_rows(df: pd.DataFrame, label: str) -> pd.DataFrame:
+    """Filter out any row that contains the word 'total' or 'totals' (case
+    insensitive, whole-word match so it doesn't clip things like 'Totally
+    Custom Co.') in ANY column. Used to strip subtotal/grand-total lines
+    that some exports tack onto the bottom of a CSV."""
+    if df.empty:
+        return df
+    total_pattern = re.compile(r"\btotals?\b", flags=re.IGNORECASE)
+    mask = df.apply(
+        lambda row: row.astype(str).str.contains(total_pattern, na=False).any(),
+        axis=1,
+    )
+    dropped = int(mask.sum())
+    if dropped:
+        inv_log(f"  Filtered out {dropped} '{label}' row(s) containing 'total(s)'")
+    return df[~mask].reset_index(drop=True)
 
-    if not invoice_eb_file:
-        messagebox.showerror("Error", "Select an eBuilder invoice file first.", parent=inv_tab)
+
+def run_invoice_comparison():
+    global invoice_eb_files, invoice_privv_files
+
+    if not invoice_eb_files:
+        messagebox.showerror("Error", "Select at least one eBuilder invoice file first.", parent=inv_tab)
         return
-    if not invoice_privv_file:
-        messagebox.showerror("Error", "Select a PRIVV invoice file first.", parent=inv_tab)
+    if not invoice_privv_files:
+        messagebox.showerror("Error", "Select at least one PRIVV invoice file first.", parent=inv_tab)
         return
 
     inv_log("\n── Running Invoice Comparison ─────────────────────────────────────")
 
-    # ── Load files ────────────────────────────────────────────────────────────
-    eb_inv  = pd.read_csv(invoice_eb_file,    dtype=str).fillna("")
-    prv_inv = pd.read_csv(invoice_privv_file, dtype=str).fillna("")
+    # ── Load & combine files ─────────────────────────────────────────────────
+    inv_log(f"  Loading {len(invoice_eb_files)} eBuilder invoice file(s)...")
+    eb_frames = []
+    for f in invoice_eb_files:
+        df = pd.read_csv(f, dtype=str).fillna("")
+        inv_log(f"    {os.path.basename(f)}: {len(df)} rows")
+        eb_frames.append(df)
+    eb_inv = pd.concat(eb_frames, ignore_index=True, sort=False).fillna("")
+
+    inv_log(f"  Loading {len(invoice_privv_files)} PRIVV invoice file(s)...")
+    prv_frames = []
+    for f in invoice_privv_files:
+        df = pd.read_csv(f, dtype=str).fillna("")
+        inv_log(f"    {os.path.basename(f)}: {len(df)} rows")
+        prv_frames.append(df)
+    prv_inv = pd.concat(prv_frames, ignore_index=True, sort=False).fillna("")
+
+    # ── Filter out total/totals rows ─────────────────────────────────────────
+    eb_inv  = _drop_total_rows(eb_inv,  "eBuilder")
+    prv_inv = _drop_total_rows(prv_inv, "PRIVV")
 
     # Give every source row a stable, unique id BEFORE any matching happens.
     # Rows can legitimately get copied into more than one comparison row's
@@ -2190,8 +2251,29 @@ def run_invoice_comparison():
     new_company_rows: list = []  # rows that match nothing at all -> own line item
 
     for _, eb_row in unmatched_eb.iterrows():
+        # If this row simply has no Commitment # at all, skip straight to
+        # the Company fallback — don't run it through the fuzzy PRIVV-vendor
+        # match or the PSU/Penn heuristic first. Rows that DO have a
+        # Commitment # but just didn't match any PRIVV key still go through
+        # the fuzzy/PSU checks below, since that's a real mismatch to
+        # resolve, not a missing value. Invoice side only.
+        if not str(eb_row.get("_commit_key", "")).strip():
+            new_company_rows.append(eb_row)
+            inv_log(f"    No Commitment # → grouped by Company directly: "
+                    f"Invoice #{eb_row.get('Invoice #','')} | "
+                    f"{eb_row.get('Company','')} | "
+                    f"${float(eb_row['_amount_num']):,.2f}")
+            continue
+
         vendor_hit = _alias_find_prv_vendor(eb_row) or _fuzzy_find_prv_vendor(eb_row)
         if vendor_hit:
+            # Collapse any Penn State variant ("The Pennsylvania State
+            # University", "Pennsylvania State University", "PSU OPP", etc.)
+            # onto the same canonical label used elsewhere, so it merges
+            # into the existing PSU OPP row instead of becoming its own
+            # separate line item.
+            if normalize(vendor_hit) in PSU_NAME_VARIANTS:
+                vendor_hit = PSU_OPP_LABEL
             vk = normalize(vendor_hit)
             fuzzy_buckets.setdefault(vk, {"label": vendor_hit, "rows": []})
             fuzzy_buckets[vk]["rows"].append(eb_row)
@@ -2273,6 +2355,18 @@ def run_invoice_comparison():
                 f"-> flagged as new/unmatched entries:")
         for eb_row in new_company_rows:
             _add_to_new_inv_company(eb_row)
+
+    # ── Force-normalize any Penn State variant label to the canonical PSU OPP
+    # label BEFORE merging duplicates. This is a final safety net that
+    # catches every code path (main Commitment# pass, fuzzy fallback, PSU
+    # keyword/date fallback, unmatched/new-company rows, whatever), not just
+    # the ones we've explicitly canonicalized above, so "The Pennsylvania
+    # State University" / "Pennsylvania State University" / "PSU OPP" etc.
+    # always collapse into the same "Penn State Office of Physical Plant"
+    # line item no matter how they were labeled going in.
+    for r in comparison_rows:
+        if normalize(r["Label"]) in PSU_NAME_VARIANTS:
+            r["Label"] = PSU_OPP_LABEL
 
     # ── Merge duplicate company entries into one row ──────────────────────────
     # Any two rows with the same normalized Label get collapsed: amounts are
