@@ -3,6 +3,12 @@
 ## Overview
 **EXPcomparerv11.py** is a sophisticated expense classification and vendor matching system that processes EBuilder commitment data and automatically assigns cost codes using a combination of weighted classification rules and fuzzy string matching algorithms.
 
+## WARNING
+
+DO NOT UPLOAD THE CREDENTIALS.JSON ONTO GIT, GOOGLE DRIVE OR ANY PUBLIC THING KEEP IT BETWEEN THE TEAM
+-Sharing said file can have it disabled in the future as google loves to do that apparently which will cause a portion of the code to fail. If this for some reason happens a new key will need to be made and without Kobe here there is potentional for a the whole alias list o be remade.
+
+
 ## Purpose
 This tool helps financial teams:
 - **Categorize** expenses from EBuilder into standardized cost codes (101-901 range)
