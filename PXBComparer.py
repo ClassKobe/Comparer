@@ -386,7 +386,8 @@ PRIVV_VENDOR_FUZZY_THRESHOLD = 87
 GENERIC_BUCKET_VENDORS = {"penn state office of physical plant"}
 
 
-def find_fuzzy_privv_matches(vendor_label: str, privv_df, threshold: int = PRIVV_VENDOR_FUZZY_THRESHOLD):
+def find_fuzzy_privv_matches(vendor_label: str, privv_df, threshold: int = PRIVV_VENDOR_FUZZY_THRESHOLD,
+                              exclude_labels=None):
     """Return every PRIVV row whose Vendor field is the same company as
     vendor_label, even if spelled slightly differently (e.g. 'Dobil
     Laboratories' vs 'Dobil Laboratories Inc'), AND every row where the
@@ -404,6 +405,23 @@ def find_fuzzy_privv_matches(vendor_label: str, privv_df, threshold: int = PRIVV
         scores >= threshold on fuzz.partial_ratio (which finds the best
         matching substring rather than comparing the whole sentence, so a
         short vendor name embedded in a longer description still matches).
+
+    exclude_labels (post-check for the PSU OPP double-count):
+        A PRIVV row like Vendor="Penn State Office of Physical Plant",
+        Description="Dobil Laboratories Inc - TV monitors..." is matched
+        TWICE by design: once for "Dobil Laboratories" (via the
+        Description-embedded-name branch below) and once for "Penn State
+        Office of Physical Plant" itself (via the plain Vendor-field
+        match), because the Vendor field literally says PSU OPP. That
+        inflates both companies' PRIVV totals with the same row.
+
+        When vendor_label is itself the generic bucket (PSU OPP) and a
+        list of every other vendor label currently on the comparison is
+        passed in via exclude_labels, this function re-runs the match for
+        each of those other vendors and removes any row they already
+        claimed from PSU OPP's result — so a row that genuinely belongs
+        to a specific named vendor (Dobil Laboratories) is counted there
+        only, and PSU OPP is left with whatever's left over.
     """
     target = normalize(vendor_label)
     if not target:
@@ -462,7 +480,23 @@ def find_fuzzy_privv_matches(vendor_label: str, privv_df, threshold: int = PRIVV
         return False
 
     mask = privv_df.apply(_is_match, axis=1)
-    return privv_df.loc[mask]
+    matches = privv_df.loc[mask]
+
+    # ── Post-check: strip out rows a specific vendor already claimed ────────
+    # Only applies when we're matching the generic PSU OPP bucket itself and
+    # the caller told us who else is on the comparison. See exclude_labels
+    # note in the docstring above for why this is needed.
+    if exclude_labels and target in GENERIC_BUCKET_VENDORS:
+        claimed_elsewhere_idx = set()
+        for other_label in exclude_labels:
+            if normalize(other_label) == target:
+                continue
+            other_matches = find_fuzzy_privv_matches(other_label, privv_df, threshold)
+            claimed_elsewhere_idx.update(other_matches.index)
+        if claimed_elsewhere_idx:
+            matches = matches.loc[~matches.index.isin(claimed_elsewhere_idx)]
+
+    return matches
 
 
 def resolve_alias(vendor_raw: str):
@@ -1202,8 +1236,9 @@ def run_comparison():
     # is the same lookup used by the entries drilldown window, so recomputing
     # every row's total with it here keeps the summary table and the
     # drilldown in agreement instead of only fixing it after a click.
+    _all_comparison_vendors = [r2["Vendor"] for r2 in comparison_rows]
     for r in comparison_rows:
-        fuzzy_matches = find_fuzzy_privv_matches(r["Vendor"], privv_df)
+        fuzzy_matches = find_fuzzy_privv_matches(r["Vendor"], privv_df, exclude_labels=_all_comparison_vendors)
         if "_amount_num" in fuzzy_matches.columns:
             fuzzy_total = fuzzy_matches["_amount_num"].sum()
         else:
@@ -1222,31 +1257,74 @@ def run_comparison():
             "🔽 eBuilder Lower"
         )
 
+    # ── De-dup pass: strip eBuilder entries also claimed by PSU OPP ─────────
+    # Walk every company row EXCEPT PSU OPP and check each of its eBuilder
+    # entries against the set of eBuilder IDs PSU OPP already claimed. Any
+    # entry that shows up in both is a double-count bug (same eBuilder row
+    # matched into a real vendor AND swept into PSU OPP) — PSU OPP wins and
+    # the entry is removed from the other company's row/total/match count.
+    # Every removal is logged to the GUI so it's visible, not silent.
+    _psu_key = "penn state office of physical plant"
+    _psu_row = next(
+        (r for r in comparison_rows if r["Vendor"].strip().lower() == _psu_key),
+        None,
+    )
+    if _psu_row is not None:
+        _psu_ids = {
+            str(e.get("ID", "")).strip()
+            for e in _psu_row.get("_entries", [])
+            if str(e.get("ID", "")).strip()
+        }
+
+        def _entry_amount(e):
+            def _num(v):
+                s = str(v).replace(",", "").strip()
+                if not s or s.lower() == "nan":
+                    return 0.0
+                try:
+                    return float(s)
+                except ValueError:
+                    return 0.0
+            cur = _num(e.get("Current Commitment", 0))
+            return cur if cur != 0 else _num(e.get("Commitment Amount", 0))
+
+        if _psu_ids:
+            _dup_lines = []
+            for r in comparison_rows:
+                if r is _psu_row:
+                    continue
+                entries = r.get("_entries", [])
+                keep, removed = [], []
+                for e in entries:
+                    eid = str(e.get("ID", "")).strip()
+                    if eid and eid in _psu_ids:
+                        removed.append(e)
+                    else:
+                        keep.append(e)
+                if removed:
+                    removed_amount = sum(_entry_amount(e) for e in removed)
+                    r["_entries"]       = keep
+                    r["eBuilder Total"] = r["eBuilder Total"] - removed_amount
+                    r["eB Matches"]     = max(0, r["eB Matches"] - len(removed))
+                    r["Delta"]          = r["eBuilder Total"] - r["PRIVV Total"]
+                    r["Status"] = (
+                        "✅ Match"           if abs(r["Delta"]) < 0.01 else
+                        "🔼 eBuilder Higher" if r["eBuilder Total"] > r["PRIVV Total"] else
+                        "🔽 eBuilder Lower"
+                    )
+                    for e in removed:
+                        _dup_lines.append(e)  # kept for internal tracking only
+
     comparison_rows.sort(key=lambda r: abs(r["Delta"]), reverse=True)
 
-    # ── DEBUG: Total entries assigned across all companies ────────────────────
+    # Total entries assigned across all companies (kept for internal use,
+    # no longer printed).
     total_assigned_entries = sum(r.get("eB Matches", 0) for r in comparison_rows)
-    log("\n── DEBUG: Entry Assignment Summary ────────────────────────────────────")
-    log(f"  {'Company':<45} {'Entries':>7}")
-    log(f"  {'-'*45} {'-'*7}")
-    for r in sorted(comparison_rows, key=lambda x: x.get("eB Matches", 0), reverse=True):
-        if r.get("eB Matches", 0) > 0:
-            log(f"  {r['Vendor'][:45]:<45} {r['eB Matches']:>7}")
-    log(f"  {'-'*45} {'-'*7}")
-    log(f"  {'TOTAL ENTRIES ASSIGNED':<45} {total_assigned_entries:>7}")
-    #log(f"  Total eBuilder rows loaded: {len(eb_raw)}")
 
-    # ── DEBUG: list eBuilder '#' (ID) codes that were actually matched ──────
     # Built from claimed_ids (every row appended into some company's
     # _entries across ALL passes: direct match, fuzzy, PSU OPP, AJP merge,
-    # _fix_zero_eb, etc.). NOTE: "eB Matches" / total_assigned_entries above
-    # is a raw SUM across passes — a row that gets matched, then re-routed
-    # by a post-pass fix, then folded into another vendor, gets counted
-    # multiple times there. That inflated sum can equal len(eb_raw) by
-    # coincidence even when some rows were never actually claimed and
-    # others were claimed 2-3 times. The discrepancy check below instead
-    # uses the DISTINCT set of eBuilder IDs that ended up in some entries
-    # list, which is the only number that reflects reality.
+    # _fix_zero_eb, etc.) — the DISTINCT set of eBuilder IDs that ended up
+    # in some entries list, used below for the true de-duped total.
     claimed_ids: set = set()
     for r in comparison_rows:
         for entry in r.get("_entries", []):
@@ -1260,9 +1338,6 @@ def run_comparison():
     )
     matched_ids   = [eid for eid in all_eb_ids if eid in claimed_ids]
     unmatched_ids = [eid for eid in all_eb_ids if eid not in claimed_ids]
-
-    log("────────────────────────────────────────────────────────────────────────\n")
-    # ── END DEBUG ─────────────────────────────────────────────────────────────
 
     # ── TRUE POST-MATCHING TOTALS (de-duplicated) ────────────────────────────
     # "eBuilder Total" on each comparison row is a per-vendor subtotal. The
@@ -1444,7 +1519,10 @@ def show_comparison_window(rows, privv_df):
         # hardcoded vendor names — see find_fuzzy_privv_matches), rather
         # than threading a separate _privv_entries field through every
         # matching pass.
-        privv_matches = find_fuzzy_privv_matches(row["Vendor"], privv_df)
+        privv_matches = find_fuzzy_privv_matches(
+            row["Vendor"], privv_df,
+            exclude_labels=[r2["Vendor"] for r2 in rows],
+        )
         privv_entries = privv_matches.to_dict("records")
         # Use the sum of what's ACTUALLY shown in the PRIVV tab (fuzzy
         # matches), not row["PRIVV Total"] — that field comes from the
@@ -1623,8 +1701,9 @@ def show_comparison_window(rows, privv_df):
         privv_headers = ["Matched To Vendor"] + privv_cols
         _style_header(privv_sheet, privv_headers)
         r_idx = 2
+        _export_vendors = [r2["Vendor"] for r2 in rows]
         for r in rows:
-            matches = find_fuzzy_privv_matches(r["Vendor"], privv_df)
+            matches = find_fuzzy_privv_matches(r["Vendor"], privv_df, exclude_labels=_export_vendors)
             for _, prow in matches.iterrows():
                 row_vals = [r.get("Vendor", "")] + [prow.get(c, "") for c in privv_cols]
                 for c_idx, val in enumerate(row_vals, start=1):
@@ -2392,6 +2471,48 @@ def run_invoice_comparison():
             seen_labels[nk] = len(merged)
             merged.append(dict(r))
     comparison_rows = merged
+
+    # ── De-dup pass: strip invoice entries also claimed by PSU OPP ──────────
+    # Same idea as the budget-comparison side: walk every company row EXCEPT
+    # PSU OPP, and if one of its invoice entries (_uid) also shows up under
+    # PSU OPP, that's a double-count — PSU OPP wins, the entry is stripped
+    # from the other company's row/total/match count, and it's logged to
+    # the GUI so the duplicate is visible instead of silently inflating
+    # both rows.
+    _psu_inv_row = next(
+        (r for r in comparison_rows if normalize(r["Label"]) == normalize(PSU_OPP_LABEL)),
+        None,
+    )
+    if _psu_inv_row is not None:
+        _psu_inv_uids = {
+            e.get("_uid") for e in _psu_inv_row.get("_eb_entries", [])
+            if e.get("_uid") is not None
+        }
+        if _psu_inv_uids:
+            _dup_inv_lines = []
+            for r in comparison_rows:
+                if r is _psu_inv_row:
+                    continue
+                entries = r.get("_eb_entries", [])
+                keep, removed = [], []
+                for e in entries:
+                    if e.get("_uid") in _psu_inv_uids:
+                        removed.append(e)
+                    else:
+                        keep.append(e)
+                if removed:
+                    removed_amount = sum(float(e.get("_amount_num", 0) or 0) for e in removed)
+                    r["_eb_entries"]    = keep
+                    r["eBuilder Total"] = r["eBuilder Total"] - removed_amount
+                    r["eB Matches"]     = max(0, r["eB Matches"] - len(removed))
+                    r["Delta"]          = r["eBuilder Total"] - r["PRIVV Total"]
+                    r["Status"] = (
+                        "✅ Match"           if abs(r["Delta"]) < 0.01 else
+                        "🔼 eBuilder Higher" if r["eBuilder Total"] > r["PRIVV Total"] else
+                        "🔽 eBuilder Lower"
+                    )
+                    for e in removed:
+                        _dup_inv_lines.append(e)  # kept for internal tracking only
 
     comparison_rows.sort(key=lambda r: abs(r["Delta"]), reverse=True)
 
