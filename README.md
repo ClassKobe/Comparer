@@ -124,11 +124,6 @@ ITEM_MAP = {
 }
 ```
 
-## Notes for Version 11
-- **Date**: 06/24/2026
-- **Current Focus**: Minimizing unaccounted-for rows (code 999)
-- **Improvement Area**: Better keyword matching and rule coverage for edge cases
-
 ## Support
 For issues or questions about specific rules, check the `note` field in `CLASSIFICATION_RULES` or review the console log output for detailed match information.
 
