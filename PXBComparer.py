@@ -2816,6 +2816,64 @@ def show_invoice_comparison_window(rows, prv_inv_df):
 
     iid_to_row: dict = {}
 
+    UNASSIGNED_LABEL = "⚠ Unassigned (Manually Removed)"
+
+    def _entry_amount(e: dict) -> float:
+        """Best-effort dollar amount for an invoice entry, whichever side
+        (eBuilder or PRIVV) it came from."""
+        amt = e.get("_amount_num", None)
+        if amt not in (None, ""):
+            try:
+                return float(amt)
+            except (TypeError, ValueError):
+                pass
+        for key in ("Invoice Amount", "Amount"):
+            if key in e:
+                s = str(e.get(key, "")).replace(",", "").strip()
+                if s and s.lower() != "nan":
+                    try:
+                        return float(s)
+                    except ValueError:
+                        continue
+        return 0.0
+
+    def _recalc_inv_row(r: dict):
+        """Recompute eBuilder Total / PRIVV Total / eB Matches / Delta /
+        Status for an invoice row from whatever is currently in
+        r['_eb_entries'] / r['_prv_entries']. Used after an entry is
+        manually reassigned or removed."""
+        eb_entries  = r.get("_eb_entries", [])
+        prv_entries = r.get("_prv_entries", [])
+        r["eBuilder Total"] = sum(_entry_amount(e) for e in eb_entries)
+        r["PRIVV Total"]    = sum(_entry_amount(e) for e in prv_entries)
+        r["eB Matches"]     = len(eb_entries)
+        r["Delta"] = r["eBuilder Total"] - r["PRIVV Total"]
+        if r["eBuilder Total"] == 0 and r["PRIVV Total"] == 0:
+            r["Status"] = "⚪ No Data"
+        elif abs(r["Delta"]) < 0.01:
+            r["Status"] = "✅ Match"
+        elif r["eBuilder Total"] > r["PRIVV Total"]:
+            r["Status"] = "🔼 eBuilder Higher"
+        else:
+            r["Status"] = "🔽 eBuilder Lower"
+
+    def _get_or_create_unassigned_inv_row():
+        for r in rows:
+            if r["Label"] == UNASSIGNED_LABEL:
+                return r
+        new_r = {
+            "Label": UNASSIGNED_LABEL,
+            "PRIVV Total": 0.0,
+            "eBuilder Total": 0.0,
+            "Delta": 0.0,
+            "eB Matches": 0,
+            "Status": "⚪ No Data",
+            "_eb_entries": [],
+            "_prv_entries": [],
+        }
+        rows.append(new_r)
+        return new_r
+
     def populate_tree(filter_text=""):
         tree.delete(*tree.get_children())
         iid_to_row.clear()
@@ -2850,23 +2908,36 @@ def show_invoice_comparison_window(rows, prv_inv_df):
 
         detail = tk.Toplevel(win)
         detail.title(f"Invoice Entries — {row['Label']}")
-        detail.geometry("1300x520")
+        detail.geometry("1300x580")
 
         hdr = tk.Frame(detail, bg="#1e1e2e", padx=10, pady=6)
         hdr.pack(fill="x")
-        tk.Label(
+        hdr_label = tk.Label(
             hdr,
             text=(f"  {row['Label']}     "
                   f"eBuilder Total: ${row['eBuilder Total']:,.2f}     "
                   f"PRIVV Total: ${row['PRIVV Total']:,.2f}     "
                   f"eB Invoices: {len(eb_entries)}     PRIVV Invoices: {len(prv_entries)}"),
             bg="#1e1e2e", fg="white", font=("Consolas", 10, "bold"), anchor="w"
-        ).pack(fill="x")
+        )
+        hdr_label.pack(fill="x")
 
         nb = ttk.Notebook(detail)
         nb.pack(fill="both", expand=True, padx=8, pady=6)
 
+        def _refresh_header():
+            hdr_label.config(
+                text=(f"  {row['Label']}     "
+                      f"eBuilder Total: ${row['eBuilder Total']:,.2f}     "
+                      f"PRIVV Total: ${row['PRIVV Total']:,.2f}     "
+                      f"eB Invoices: {len(row.get('_eb_entries', []))}     "
+                      f"PRIVV Invoices: {len(row.get('_prv_entries', []))}"),
+            )
+
         def _build_inv_tab(parent, entries, fallback_cols, label):
+            """Build one Entries tab. Returns (etree, iid_to_entry_index,
+            redraw_fn) so the reassign controls below can read the current
+            selection and redraw in place after a move/remove."""
             if entries:
                 tab_cols = []
                 seen = set()
@@ -2883,29 +2954,129 @@ def show_invoice_comparison_window(rows, prv_inv_df):
             evsb = ttk.Scrollbar(f, orient="vertical")
             ehsb = ttk.Scrollbar(f, orient="horizontal")
             etree = ttk.Treeview(f, columns=tab_cols, show="headings",
-                                  yscrollcommand=evsb.set, xscrollcommand=ehsb.set, height=16)
+                                  yscrollcommand=evsb.set, xscrollcommand=ehsb.set, height=14)
             evsb.config(command=etree.yview)
             ehsb.config(command=etree.xview)
             money = {"Invoice Amount", "Amount", "_amount_num"}
             for c in tab_cols:
                 etree.heading(c, text=c)
                 etree.column(c, width=150, anchor="e" if c in money else "w")
-            if entries:
-                for e in entries:
-                    etree.insert("", "end", values=tuple(e.get(c, "") for c in tab_cols))
-            else:
-                etree.insert("", "end", values=(label,) + ("",) * (len(tab_cols) - 1))
+
+            iid_to_entry_index = {}
+
+            def _redraw(current_entries):
+                etree.delete(*etree.get_children())
+                iid_to_entry_index.clear()
+                if current_entries:
+                    for i, e in enumerate(current_entries):
+                        iid = etree.insert("", "end", values=tuple(e.get(c, "") for c in tab_cols))
+                        iid_to_entry_index[iid] = i
+                else:
+                    etree.insert("", "end", values=(label,) + ("",) * (len(tab_cols) - 1))
+
+            _redraw(entries)
             evsb.pack(side="right", fill="y")
             ehsb.pack(side="bottom", fill="x")
             etree.pack(fill="both", expand=True)
+            return etree, iid_to_entry_index, _redraw
 
         eb_tab_frame  = tk.Frame(nb)
         prv_tab_frame = tk.Frame(nb)
         nb.add(eb_tab_frame,  text=f"eBuilder Invoices ({len(eb_entries)})")
         nb.add(prv_tab_frame, text=f"PRIVV Invoices ({len(prv_entries)})")
 
-        _build_inv_tab(eb_tab_frame,  eb_entries,  ["Invoice #", "Description", "Company", "Commitment #", "Invoice Amount"], "(No eBuilder entries)")
-        _build_inv_tab(prv_tab_frame, prv_entries, list(prv_inv_df.columns), "(No PRIVV entries)")
+        eb_tree, eb_iid_to_entry, eb_redraw = _build_inv_tab(
+            eb_tab_frame, eb_entries,
+            ["Invoice #", "Description", "Company", "Commitment #", "Invoice Amount"],
+            "(No eBuilder entries)",
+        )
+        prv_tree, prv_iid_to_entry, prv_redraw = _build_inv_tab(
+            prv_tab_frame, prv_entries, list(prv_inv_df.columns), "(No PRIVV entries)",
+        )
+
+        def _label_choices():
+            choices = [r["Label"] for r in rows if r["Label"] != row["Label"]]
+            choices.sort(key=str.lower)
+            choices.append(UNASSIGNED_LABEL)
+            return choices
+
+        def _make_reassign_controls(parent, entries_key: str, etree, iid_to_entry,
+                                     redraw_fn, tab_widget, tab_text_prefix):
+            """Adds a 'Selected entry -> [combobox] [Move] [Remove/Unassign]'
+            row under an entries tree, wired to move/remove the selected
+            entry between this invoice-comparison row and any other (or the
+            Unassigned bucket)."""
+            frame = tk.Frame(parent, pady=6)
+            frame.pack(fill="x", padx=8)
+
+            tk.Label(frame, text="Selected entry →").pack(side="left")
+
+            reassign_var = tk.StringVar()
+            reassign_box = ttk.Combobox(
+                frame, textvariable=reassign_var, values=_label_choices(),
+                width=45, state="readonly",
+            )
+            reassign_box.pack(side="left", padx=6)
+
+            def _refresh_this_tab():
+                current_entries = row.get(entries_key, [])
+                redraw_fn(current_entries)
+                nb.tab(tab_widget, text=f"{tab_text_prefix} ({len(current_entries)})")
+                reassign_box.config(values=_label_choices())
+                _refresh_header()
+
+            def apply_reassign():
+                sel = etree.selection()
+                if not sel:
+                    messagebox.showwarning("No entry selected", "Select an entry first.", parent=detail)
+                    return
+                idx = iid_to_entry.get(sel[0])
+                if idx is None:
+                    return
+                target_label = reassign_var.get()
+                if not target_label:
+                    messagebox.showwarning("No destination", "Choose where to move this entry.", parent=detail)
+                    return
+
+                entries_list = row.get(entries_key, [])
+                if idx >= len(entries_list):
+                    return
+                entry = entries_list.pop(idx)
+                _recalc_inv_row(row)
+
+                if target_label == UNASSIGNED_LABEL:
+                    target_row = _get_or_create_unassigned_inv_row()
+                else:
+                    target_row = next((r for r in rows if r["Label"] == target_label), None)
+                    if target_row is None:
+                        entries_list.insert(idx, entry)  # target vanished, revert
+                        _recalc_inv_row(row)
+                        return
+                target_row.setdefault(entries_key, []).append(entry)
+                _recalc_inv_row(target_row)
+
+                populate_tree(search_var.get())
+                _refresh_this_tab()
+                side = "eBuilder" if entries_key == "_eb_entries" else "PRIVV"
+                inv_log(f"Moved {side} invoice entry from '{row['Label']}' to '{target_row['Label']}'.")
+
+            def remove_entry():
+                reassign_var.set(UNASSIGNED_LABEL)
+                apply_reassign()
+
+            tk.Button(frame, text="Move Entry", command=apply_reassign,
+                      bg="#0066cc", fg="white", padx=8).pack(side="left", padx=4)
+            tk.Button(frame, text="🗑 Remove / Unassign", command=remove_entry,
+                      padx=8).pack(side="left", padx=4)
+
+        _make_reassign_controls(
+            eb_tab_frame, "_eb_entries", eb_tree, eb_iid_to_entry,
+            eb_redraw, eb_tab_frame, "eBuilder Invoices",
+        )
+        _make_reassign_controls(
+            prv_tab_frame, "_prv_entries", prv_tree, prv_iid_to_entry,
+            prv_redraw, prv_tab_frame, "PRIVV Invoices",
+        )
 
         tk.Button(detail, text="Close", command=detail.destroy, padx=10).pack(pady=6)
 
