@@ -1431,6 +1431,55 @@ def show_comparison_window(rows, privv_df):
     # Map tree item iid → row dict so we can look up _entries on click
     iid_to_row: dict = {}
 
+    UNASSIGNED_LABEL = "⚠ Unassigned (Manually Removed)"
+
+    def _entry_amount(e: dict) -> float:
+        """Same amount rule used everywhere else in the matcher: prefer
+        Current Commitment, fall back to Commitment Amount."""
+        def _num(v):
+            s = str(v).replace(",", "").strip()
+            if not s or s.lower() == "nan":
+                return 0.0
+            try:
+                return float(s)
+            except ValueError:
+                return 0.0
+        cur = _num(e.get("Current Commitment", 0))
+        return cur if cur != 0 else _num(e.get("Commitment Amount", 0))
+
+    def _recalc_row(r: dict):
+        """Recompute eBuilder Total / eB Matches / Delta / Status for a row
+        from whatever is currently in r['_entries']. Used after an entry is
+        manually reassigned or removed."""
+        entries = r.get("_entries", [])
+        r["eBuilder Total"] = sum(_entry_amount(e) for e in entries)
+        r["eB Matches"] = len(entries)
+        r["Delta"] = r["eBuilder Total"] - r["PRIVV Total"]
+        if r["eBuilder Total"] == 0 and r["PRIVV Total"] == 0:
+            r["Status"] = "⚪ No Data"
+        elif abs(r["Delta"]) < 0.01:
+            r["Status"] = "✅ Match"
+        elif r["eBuilder Total"] > r["PRIVV Total"]:
+            r["Status"] = "🔼 eBuilder Higher"
+        else:
+            r["Status"] = "🔽 eBuilder Lower"
+
+    def _get_or_create_unassigned_row():
+        for r in rows:
+            if r["Vendor"] == UNASSIGNED_LABEL:
+                return r
+        new_r = {
+            "Vendor": UNASSIGNED_LABEL,
+            "PRIVV Total": 0.0,
+            "eBuilder Total": 0.0,
+            "Delta": 0.0,
+            "eB Matches": 0,
+            "Status": "⚪ No Data",
+            "_entries": [],
+        }
+        rows.append(new_r)
+        return new_r
+
     def populate_tree(filter_text=""):
         tree.delete(*tree.get_children())
         iid_to_row.clear()
@@ -1501,10 +1550,18 @@ def show_comparison_window(rows, privv_df):
 
         _populate_entries_tree(etree, entries, entry_cols, empty_label)
 
+        # Map tree iid -> index into `entries` (the SAME list object that
+        # lives on the row, e.g. row["_entries"]) so callers can mutate the
+        # underlying list directly when the user reassigns/removes a line.
+        iid_to_entry_index = {}
+        if entries:
+            for i, iid in enumerate(etree.get_children()):
+                iid_to_entry_index[iid] = i
+
         evsb.pack(side="right", fill="y")
         ehsb.pack(side="bottom", fill="x")
         etree.pack(fill="both", expand=True)
-        return etree
+        return etree, iid_to_entry_index
 
     def show_entries_window(event=None):
         sel = tree.selection()
@@ -1546,7 +1603,7 @@ def show_comparison_window(rows, privv_df):
 
         hdr = tk.Frame(detail, bg="#1e1e2e", padx=10, pady=6)
         hdr.pack(fill="x")
-        tk.Label(
+        hdr_label = tk.Label(
             hdr,
             text=f"  Vendor: {row['Vendor']}     "
                  f"eBuilder Total: ${row['eBuilder Total']:,.2f}     "
@@ -1554,7 +1611,8 @@ def show_comparison_window(rows, privv_df):
                  f"eB Entries: {len(eb_entries)}     "
                  f"PRIVV Entries: {len(privv_entries)}",
             bg="#1e1e2e", fg="white", font=("Consolas", 10, "bold"), anchor="w"
-        ).pack(fill="x")
+        )
+        hdr_label.pack(fill="x")
 
         nb = ttk.Notebook(detail)
         nb.pack(fill="both", expand=True, padx=8, pady=6)
@@ -1571,7 +1629,7 @@ def show_comparison_window(rows, privv_df):
             "Projected Commitment": 130, "Actuals Approved": 130,
             "Remaining Balance": 130,
         }
-        _build_entries_tab(
+        eb_tree, eb_iid_to_entry = _build_entries_tab(
             eb_tab, eb_entries, ENTRY_COLS, eb_col_widths,
             "(No eBuilder entries found)",
         )
@@ -1584,6 +1642,90 @@ def show_comparison_window(rows, privv_df):
             privv_tab, privv_entries, list(privv_df.columns), privv_col_widths,
             "(No PRIVV entries found)",
         )
+
+        # ── Reassign / remove a selected eBuilder entry ─────────────────────
+        reassign_frame = tk.Frame(eb_tab, pady=6)
+        reassign_frame.pack(fill="x", padx=8)
+
+        tk.Label(reassign_frame, text="Selected entry →").pack(side="left")
+
+        vendor_choices = [r["Vendor"] for r in rows if r["Vendor"] != row["Vendor"]]
+        vendor_choices.sort(key=str.lower)
+        vendor_choices.append(UNASSIGNED_LABEL)
+
+        reassign_var = tk.StringVar()
+        reassign_box = ttk.Combobox(
+            reassign_frame, textvariable=reassign_var, values=vendor_choices,
+            width=45, state="readonly",
+        )
+        reassign_box.pack(side="left", padx=6)
+
+        def refresh_eb_tab():
+            """Re-pull row['_entries'] and redraw the eBuilder tab + header
+            in place, without closing the detail window."""
+            nonlocal eb_entries, eb_iid_to_entry
+            eb_entries = row.get("_entries", [])
+            eb_tree.delete(*eb_tree.get_children())
+            _populate_entries_tree(eb_tree, eb_entries, ENTRY_COLS, "(No eBuilder entries found)")
+            eb_iid_to_entry = {iid: i for i, iid in enumerate(eb_tree.get_children())} if eb_entries else {}
+            nb.tab(eb_tab, text=f"eBuilder Entries ({len(eb_entries)})")
+            hdr_label.config(
+                text=f"  Vendor: {row['Vendor']}     "
+                     f"eBuilder Total: ${row['eBuilder Total']:,.2f}     "
+                     f"PRIVV Total: ${privv_total_fuzzy:,.2f}{privv_total_note}     "
+                     f"eB Entries: {len(eb_entries)}     "
+                     f"PRIVV Entries: {len(privv_entries)}",
+            )
+            # Vendor list in the combobox can change (a target may now be
+            # the freshly-created Unassigned bucket), so keep it current.
+            choices = [r["Vendor"] for r in rows if r["Vendor"] != row["Vendor"]]
+            choices.sort(key=str.lower)
+            choices.append(UNASSIGNED_LABEL)
+            reassign_box.config(values=choices)
+
+        def apply_reassign():
+            sel = eb_tree.selection()
+            if not sel:
+                messagebox.showwarning("No entry selected", "Select an eBuilder entry first.", parent=detail)
+                return
+            idx = eb_iid_to_entry.get(sel[0])
+            if idx is None:
+                return
+            target_label = reassign_var.get()
+            if not target_label:
+                messagebox.showwarning("No destination", "Choose where to move this entry.", parent=detail)
+                return
+
+            entries_list = row.get("_entries", [])
+            if idx >= len(entries_list):
+                return
+            entry = entries_list.pop(idx)
+            _recalc_row(row)
+
+            if target_label == UNASSIGNED_LABEL:
+                target_row = _get_or_create_unassigned_row()
+            else:
+                target_row = next((r for r in rows if r["Vendor"] == target_label), None)
+                if target_row is None:
+                    entries_list.insert(idx, entry)  # target vanished, revert
+                    _recalc_row(row)
+                    return
+            target_row.setdefault("_entries", []).append(entry)
+            _recalc_row(target_row)
+
+            populate_tree(search_var.get())
+            refresh_eb_tab()
+            log(f"Moved eBuilder entry (ID {entry.get('ID', '?')}) "
+                f"from '{row['Vendor']}' to '{target_row['Vendor']}'.")
+
+        def remove_entry():
+            reassign_var.set(UNASSIGNED_LABEL)
+            apply_reassign()
+
+        tk.Button(reassign_frame, text="Move Entry", command=apply_reassign,
+                  bg="#0066cc", fg="white", padx=8).pack(side="left", padx=4)
+        tk.Button(reassign_frame, text="🗑 Remove / Unassign", command=remove_entry,
+                  padx=8).pack(side="left", padx=4)
 
         tk.Button(detail, text="Close", command=detail.destroy, padx=10).pack(pady=6)
 
@@ -2513,6 +2655,48 @@ def run_invoice_comparison():
                     )
                     for e in removed:
                         _dup_inv_lines.append(e)  # kept for internal tracking only
+
+    # ── De-dup pass: strip PRIVV entries also claimed by PSU OPP ────────────
+    # Mirrors the eBuilder de-dup pass directly above — same double-count bug
+    # can happen on the PRIVV side too (e.g. a PRIVV row logged under the
+    # generic PSU OPP Vendor # but whose Vendor/Description names a specific
+    # real vendor, or any other path that lets a PRIVV row's _uid land under
+    # two different comparison rows). Without this, such a row was only
+    # flagged later in the "TRUE POST-MATCHING TOTALS" log message
+    # (dup_prv_count) instead of actually being corrected here — this pass
+    # fixes it the same way the eBuilder side already is: PSU OPP wins, the
+    # entry is stripped from the other company's row/total, and it's logged.
+    if _psu_inv_row is not None:
+        _psu_inv_prv_uids = {
+            e.get("_uid") for e in _psu_inv_row.get("_prv_entries", [])
+            if e.get("_uid") is not None
+        }
+        if _psu_inv_prv_uids:
+            _dup_prv_lines = []
+            for r in comparison_rows:
+                if r is _psu_inv_row:
+                    continue
+                entries = r.get("_prv_entries", [])
+                keep, removed = [], []
+                for e in entries:
+                    if e.get("_uid") in _psu_inv_prv_uids:
+                        removed.append(e)
+                    else:
+                        keep.append(e)
+                if removed:
+                    removed_amount = sum(float(e.get("_amount_num", 0) or 0) for e in removed)
+                    r["_prv_entries"] = keep
+                    r["PRIVV Total"]  = r["PRIVV Total"] - removed_amount
+                    r["Delta"]        = r["eBuilder Total"] - r["PRIVV Total"]
+                    r["Status"] = (
+                        "✅ Match"           if abs(r["Delta"]) < 0.01 else
+                        "🔼 eBuilder Higher" if r["eBuilder Total"] > r["PRIVV Total"] else
+                        "🔽 eBuilder Lower"
+                    )
+                    for e in removed:
+                        _dup_prv_lines.append(e)  # kept for internal tracking only
+                    inv_log(f"    ⚠ Removed {len(removed)} PRIVV entry(ies) (${removed_amount:,.2f}) "
+                            f"from '{r['Label']}' — already claimed by PSU OPP.")
 
     comparison_rows.sort(key=lambda r: abs(r["Delta"]), reverse=True)
 
