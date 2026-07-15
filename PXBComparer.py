@@ -2107,6 +2107,60 @@ def normalize_commit_num(val: str) -> str:
     return str(int(digits)) if digits else ""
 
 
+# ── Known PRIVV Vendor # data-entry corrections ─────────────────────────────
+# Invoice comparison groups PRIVV rows by Vendor # (see _prv_vendor_key
+# below). Every so often the PRIVV export carries the WRONG Vendor # on one
+# specific row — a typo in the source system, not a code bug — so that row's
+# dollar amount silently lands under whichever OTHER vendor legitimately
+# owns that number instead of the vendor actually named on the row.
+#
+# Corrections here are keyed by (resolved vendor name, Invoice #) — both run
+# through normalize() — so a fix only ever touches the exact row it targets.
+# This is deliberately row-specific rather than vendor-wide: BMAHAJV, for
+# example, legitimately uses more than one real Vendor # (8103140 for its MM
+# pay apps, 8103164 for its CW pay apps), so overriding every "BMAHAJV" row
+# to a single number would misfile the rows that are already keyed
+# correctly.
+#
+# Vendor names are resolved through resolve_alias() before the lookup — the
+# same Google Sheet (VendorAliases tab) + hardcoded VENDOR_ALIASES map used
+# everywhere else in this file — so a correction still fires even if the
+# vendor is later renamed/aliased on either side, and it never fights with
+# alias-driven matching elsewhere.
+INVOICE_KEY_CORRECTIONS = {
+    # 3/30/2025 "TV MM Pay App 19" (Invoice # "TV MM CPA - 0019",
+    # $49,424.38): row was keyed to Precis Engineering's Vendor #
+    # (8104146) instead of BMAHAJV's own MM Vendor # (8103140), which was
+    # pulling this invoice into Precis Engineering's total.
+    (normalize("bmahajv"), normalize("TV MM CPA - 0019")): "8103140",
+}
+
+
+def _resolved_vendor_name(vendor_raw: str) -> str:
+    """Run a raw Vendor string through the same alias resolution used
+    elsewhere (Google Sheet VendorAliases tab first, then hardcoded
+    VENDOR_ALIASES), collapsing a list result down to its first entry."""
+    resolved = resolve_alias(vendor_raw)
+    return resolved[0] if isinstance(resolved, list) else resolved
+
+
+def _prv_vendor_key(row) -> str:
+    """Return the PRIVV grouping key for a row: normally just its own
+    Vendor #, unless it matches a known bad-data row in
+    INVOICE_KEY_CORRECTIONS, in which case the corrected Vendor # is used
+    instead. Checks both the raw Vendor text and its alias-resolved form so
+    a correction keeps working regardless of which spelling is on the row."""
+    raw_key = normalize_commit_num(row.get("Vendor #", ""))
+    vendor_raw = str(row.get("Vendor", "")).strip()
+    invoice_num = normalize(str(row.get("Invoice #", "")))
+
+    for candidate_name in {normalize(vendor_raw), normalize(_resolved_vendor_name(vendor_raw))}:
+        override = INVOICE_KEY_CORRECTIONS.get((candidate_name, invoice_num))
+        if override is not None:
+            return normalize_commit_num(override)
+    return raw_key
+
+
 # ---------------------------------------------------------------------------
 # INVOICE COMPARISON LOGIC
 # ---------------------------------------------------------------------------
@@ -2200,7 +2254,7 @@ def run_invoice_comparison():
     # eBuilder  → Commitment # (e.g. "000925000")
     # PRIVV     → Vendor #     (e.g. "8103142")
     eb_inv["_commit_key"]  = eb_inv["Commitment #"].apply(normalize_commit_num)
-    prv_inv["_vendor_key"] = prv_inv["Vendor #"].apply(normalize_commit_num)
+    prv_inv["_vendor_key"] = prv_inv.apply(_prv_vendor_key, axis=1)
 
     # ── Build PRIVV lookup: vendor_key → rows ─────────────────────────────────
     prv_by_key: dict = {}
@@ -3306,7 +3360,7 @@ tk.Button(
     width=16, padx=6
 ).pack(side="left", padx=4)
 
-# Load whatever is already in the sheet as soon as the app starts, so
+# Load whatever is already in the sheet aWSs soon as the app starts, so
 # resolve_alias() has the latest user-taught mappings from the very first
 # comparison/invoice run - not just after visiting this tab.
 refresh_alias_tree()
@@ -3314,9 +3368,11 @@ refresh_alias_tree()
 root.mainloop()
 
 
+    
+
 #06/24/2026 Handles the budget part of the porogram
 
 
 #6.28.2026 working on invoice part of the program
 
-#6/30/2026 Invoices does sum i need to double check the accuracy of the program hopefully it
+#6/30/2026 Invoices does sum i need to double check the accuracy of the program hopefully ity
