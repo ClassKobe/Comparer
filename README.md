@@ -1,132 +1,100 @@
-# EBuilder → PRIVV Processor (Weighted Classifier + Fuzzy Match)
+# EBuilder → PRIVV Processor
 
-## Overview
-**EXPcomparer.py** is a sophisticated expense classification and vendor matching system that processes EBuilder commitment data and automatically assigns cost codes using a combination of weighted classification rules and fuzzy string matching algorithms.
+A desktop (Tkinter) tool for reconciling construction commitment and invoice
+data exported from **eBuilder** against **PRIVV** exports, for the Beaver
+Stadium Renovation project. It cross-checks vendor amounts, classifies
+commitments into PRIVV budget line codes, matches invoices between the two
+systems, and exports formatted Excel reports.
 
-## WARNING
+## What it does
 
-DO NOT UPLOAD THE CREDENTIALS.JSON ONTO GIT, GOOGLE DRIVE OR ANY PUBLIC THING KEEP IT BETWEEN THE TEAM
--Sharing said file can have it disabled in the future as google loves to do that apparently which will cause a portion of the code to fail. If this for some reason happens a new key will need to be made and without Kobe here there is potentional for a the whole alias list o be remade.
+The app has three tabs:
+
+### 1. Commited (Budget/Commitment Comparison)
+- Load one or more eBuilder commitment export CSVs and a single PRIVV
+  commitment export CSV.
+- Classifies each eBuilder commitment into a PRIVV budget code (e.g. `403`,
+  `503.4`, `711`) using a weighted keyword classifier (`CLASSIFICATION_RULES`)
+  that looks at vendor name, description, and commitment type.
+- Cross-references vendor totals between eBuilder and PRIVV, using fuzzy
+  matching (`rapidfuzz`) plus a vendor alias table to reconcile vendors that
+  are named differently in each system.
+- Displays a side-by-side comparison window (amounts, deltas, match status).
 
 
-## Purpose
-This tool helps financial teams:
-- **Categorize** expenses from EBuilder into standardized cost codes (101-901 range)
-- **Match** vendor names with high accuracy using fuzzy matching
-- **Aggregate** purchase orders by vendor and cost code
-- **Export** processed data to a CSV file ready for PRIVV import
-- **Identify** unmatched or problematic entries for manual review
+### 2. Invoices
+- Load eBuilder invoice export CSV(s) (needs `Commitment #` and
+  `Invoice Amount` columns) and a PRIVV invoice export CSV (needs
+  `Vendor #` and `Amount` columns).
+- Groups PRIVV rows by vendor and matches eBuilder invoice rows to each
+  vendor by Company name, using the same alias/fuzzy matching logic as the
+  Commited tab, so mismatched or reused vendor numbers don't cause invoices
+  to be misassigned.
+- Handles a few special cases automatically:
+  - Penn State Office of Physical Plant name variants are collapsed into one
+    "Penn State Office of Physical Plant" line.
+  - Rows that can't be matched by vendor/alias fall back to a fuzzy match
+    against Company/Description text before being flagged as unmatched.
+- Shows a comparison window (PRIVV total vs. eBuilder total, delta, match
+  count, status) with an **Export to Excel** button that produces a
+  multi-sheet workbook: a summary sheet plus the raw matched eBuilder and
+  PRIVV invoice line items.
 
-## Key Features
-✅ **Weighted Classification System** - Rules have priority weights to handle overlapping matches  
-✅ **Fuzzy Matching** - Uses RapidFuzz to match vendor names despite typos/variations  
-✅ **Multi-Field Scanning** - Searches vendor name, description, and commitment type fields  
-✅ **Purchase Order Grouping** - Automatically aggregates POs by vendor and cost code  
-✅ **Detailed Logging** - Provides transparent match notes showing why each row was classified  
-✅ **Excel Export** - Creates styled Excel reports with color-coded classifications  
-✅ **User-Friendly GUI** - Simple Tkinter interface for selecting files and running comparisons  
+### 3. Vendor Aliases
+- Maintains a shared "Vendor Name → Alias" table stored in a Google Sheet
+  (tab `VendorAliases` inside the `learned_rules` spreadsheet), so multiple
+  users can teach the matcher new vendor-name variants without editing code.
+- Aliases entered here are combined with the hardcoded `VENDOR_ALIASES` map
+  in the script and used immediately by both the Commited and Invoices tabs.
+- If `gspread`/`google-auth` aren't installed, or `credentials.json` isn't
+  present, this tab still works locally but aliases won't be shared/persisted
+  to the sheet.
 
-## System Requirements
-- Python 3.7+
-- Required packages:
-  - `pandas` - Data manipulation
-  - `openpyxl` - Excel file handling
-  - `rapidfuzz` - Fuzzy string matching
-  - `tkinter` - GUI (usually included with Python)
-  - `gitpython` - GUI (usually included with Python)
- 
-  - WHEN INSTALLING PYTHON ADD PYTHON.EXE TO PATH ELSE YOU WILL MANUALLY HAVE TO ADD YOUR FILE TO PATH (THIS IS DIFFICULT IF YOU MESS UP UNINSTALL PYTHON AND TRY AGAIN)
+## Requirements
 
-## Installation
+- Python 3.9+
+- Packages:
+  ```
+  pandas
+  rapidfuzz
+  openpyxl
+  GitPython
+  google-auth
+  gspread
+  ```
+  (Tkinter ships with most standard Python installs; `google-auth`/`gspread`
+  are optional — the app degrades gracefully to local-only aliases without
+  them.)
+
+## Google Sheets setup (optional, for shared Vendor Aliases)
+
+1. Create a Google Cloud service account and download its JSON key.
+2. Save the key file as `credentials.json` in the same folder as the script.
+3. Share the `learned_rules` Google Sheet with the service account's email
+   address (found inside `credentials.json`).
+4. The app will create a `VendorAliases` tab in that sheet automatically the
+   first time it's needed.
+
+Without this setup, the Vendor Aliases tab and alias matching still function
+using only the hardcoded `VENDOR_ALIASES` table in the script.
+
+## Running the app
+
 ```bash
-pip install pandas gitpython rapidfuzz openpyxl gitpython```
-
-## How to Use
-
-### Step 1: Prepare Input Files
-You need two CSV files:
-
-**EBuilder File** (e.g., `ebuilder_data.csv`)
-- Must contain columns: Description, Company, Current Commitment, Date, Commitment Type, Vendor
-- Rows with empty descriptions are automatically filtered out
-
-**PRIVV File** (e.g., `privv_lookup.csv`)
-- Must contain columns: Vendor, Code
-- Used to build the lookup dictionary for fuzzy matching
-
-### Step 2: Run the Application
-```bash
-python python_file.py
+python New_Python_Source_File.py
 ```
 
-### Step 3: Select Files
-1. Click **"Select eBuilder Files"** - Choose one or more CSV files containing commitment data
-2. Click **"Select PRIVV File"** - Choose the CSV file with vendor-to-code mappings
-3. Review selected files in the labels below each button
+This opens the GUI directly — there's no command-line mode.
 
-### Step 4: Run Comparison
-1. Click **"Compare Vendors"**
-2. The program will:
-   - Load both files
-   - Apply classification rules (weighted)
-   - Perform fuzzy matching on unmatched items
-   - Group purchase orders
-   - Export results
-3. Monitor progress in the output box
+## Typical workflow
 
-### Step 5: Run invoices 
-1. Click **"invoices tab then the big green button"**
-2. The program will:
-   - Load both files
-   - Apply classification rules (weighted)
-   - Perform fuzzy matching on unmatched items
-   - Group purchase orders
-   - Export results
-
-### Step 6: Vendor allias's 
-1. Type in the name of the vendor
-2. Type in the allias
-  -From here the code will read the google sheet next time you run it
-  -Allowing for the user to input allias's for vendors (Or if the code is being annoying you can input it however u please)
-
-### Step 7: Review Output
-The tool generates `privv_importable.csv` with the following columns:
-- **Code** - Cost code (e.g., 601, 708, 501)
-- **Vendor** - Company/vendor name
-- **Description** - Original description from EBuilder
-- **PO Number** - (Currently empty, for future use)
-- **Item Description** - Human-readable cost code label (e.g., "Signage", "Video Displays")
-- **Date Committed** - Formatted date
-- **Type** - "Change Order" or "Original"
-- **Amount** - Current commitment amount
-
-## Advanced Features
-
-### Excel Report Generation (Optional)
-The code can generate a styled Excel report with:
-- Color-coded cost codes (by category)
-- Sorted by code
-- Professional formatting (borders, fonts, alignment)
-- Conditional highlighting for unmatched rows
-
-### Custom Rule Addition
-To add a new classification rule, edit the `CLASSIFICATION_RULES` list:
-```python
-{"code": "999", "weight": 200, "fields": ["vendor", "desc"], "keywords": ["your_keyword"], "note": "Your rule description"}
-```
-
-### Extending the Lookup
-Update `ITEM_MAP` dictionary to add new cost codes or descriptions:
-```python
-ITEM_MAP = {
-    "999": "Your New Cost Code Label",
-    ...
-}
-```
-
-## Support
-For issues or questions about specific rules, check the `note` field in `CLASSIFICATION_RULES` or review the console log output for detailed match information.
-
----
-
-
+1. **Commited tab:** select your eBuilder commitment CSV(s) and PRIVV
+   commitment CSV, then run the comparison. Review any mismatches, add
+   vendor aliases as needed (Vendor Aliases tab), and re-run until totals
+   reconcile. 
+2. **Invoices tab:** select your eBuilder invoice CSV(s) and PRIVV invoice
+   CSV, run the comparison, review the results window, and use
+   **Export to Excel** to save a formatted workbook for sharing/records.
+3. **Vendor Aliases tab:** whenever a vendor is matched incorrectly or not
+   matched at all, add a Vendor Name → Alias pair here so future runs
+   resolve it correctly.
