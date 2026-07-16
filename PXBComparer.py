@@ -528,6 +528,36 @@ def resolve_alias_list(vendor_raw: str) -> list:
     return [result]
 
 
+def alias_equivalents(vendor_raw: str) -> set:
+    """Return the full set of names (raw, as stored in the alias tables)
+    known to refer to the SAME vendor as `vendor_raw` — checking both the
+    alias KEY and its VALUE(s), in both directions.
+
+    resolve_alias() only matches when `vendor_raw` looks like a known KEY.
+    But alias entries are frequently written the other way around too —
+    e.g. VENDOR_ALIASES["bmahajv"] = ["Barton Malow - Alexander - II Joint
+    Venture ^", ...] — where the eBuilder side actually shows one of the
+    long VALUE variants, not the short key "bmahajv". A forward-only
+    lookup never connects that text back to its vendor. This function
+    checks membership in the whole {key + values} group in either
+    direction, so it works regardless of which form the input happens to
+    be, for any alias entry shaped that way — not a one-off special case.
+    """
+    text = str(vendor_raw).strip()
+    if not text:
+        return set()
+    ntext = normalize(text)
+    equivalents: set = {text}
+    for table in (SHEET_VENDOR_ALIASES, VENDOR_ALIASES):
+        for alias_key, canonical in table.items():
+            canon_list = canonical if isinstance(canonical, list) else [canonical]
+            group = [alias_key] + canon_list
+            group_norm = [normalize(g) for g in group]
+            if any(ntext == g or (g and (ntext in g or g in ntext)) for g in group_norm):
+                equivalents.update(group)
+    return equivalents
+
+
 def convert_date(val):
     try:
         if pd.isna(val) or str(val).strip() == "":
@@ -2107,60 +2137,6 @@ def normalize_commit_num(val: str) -> str:
     return str(int(digits)) if digits else ""
 
 
-# ── Known PRIVV Vendor # data-entry corrections ─────────────────────────────
-# Invoice comparison groups PRIVV rows by Vendor # (see _prv_vendor_key
-# below). Every so often the PRIVV export carries the WRONG Vendor # on one
-# specific row — a typo in the source system, not a code bug — so that row's
-# dollar amount silently lands under whichever OTHER vendor legitimately
-# owns that number instead of the vendor actually named on the row.
-#
-# Corrections here are keyed by (resolved vendor name, Invoice #) — both run
-# through normalize() — so a fix only ever touches the exact row it targets.
-# This is deliberately row-specific rather than vendor-wide: BMAHAJV, for
-# example, legitimately uses more than one real Vendor # (8103140 for its MM
-# pay apps, 8103164 for its CW pay apps), so overriding every "BMAHAJV" row
-# to a single number would misfile the rows that are already keyed
-# correctly.
-#
-# Vendor names are resolved through resolve_alias() before the lookup — the
-# same Google Sheet (VendorAliases tab) + hardcoded VENDOR_ALIASES map used
-# everywhere else in this file — so a correction still fires even if the
-# vendor is later renamed/aliased on either side, and it never fights with
-# alias-driven matching elsewhere.
-INVOICE_KEY_CORRECTIONS = {
-    # 3/30/2025 "TV MM Pay App 19" (Invoice # "TV MM CPA - 0019",
-    # $49,424.38): row was keyed to Precis Engineering's Vendor #
-    # (8104146) instead of BMAHAJV's own MM Vendor # (8103140), which was
-    # pulling this invoice into Precis Engineering's total.
-    (normalize("bmahajv"), normalize("TV MM CPA - 0019")): "8103140",
-}
-
-
-def _resolved_vendor_name(vendor_raw: str) -> str:
-    """Run a raw Vendor string through the same alias resolution used
-    elsewhere (Google Sheet VendorAliases tab first, then hardcoded
-    VENDOR_ALIASES), collapsing a list result down to its first entry."""
-    resolved = resolve_alias(vendor_raw)
-    return resolved[0] if isinstance(resolved, list) else resolved
-
-
-def _prv_vendor_key(row) -> str:
-    """Return the PRIVV grouping key for a row: normally just its own
-    Vendor #, unless it matches a known bad-data row in
-    INVOICE_KEY_CORRECTIONS, in which case the corrected Vendor # is used
-    instead. Checks both the raw Vendor text and its alias-resolved form so
-    a correction keeps working regardless of which spelling is on the row."""
-    raw_key = normalize_commit_num(row.get("Vendor #", ""))
-    vendor_raw = str(row.get("Vendor", "")).strip()
-    invoice_num = normalize(str(row.get("Invoice #", "")))
-
-    for candidate_name in {normalize(vendor_raw), normalize(_resolved_vendor_name(vendor_raw))}:
-        override = INVOICE_KEY_CORRECTIONS.get((candidate_name, invoice_num))
-        if override is not None:
-            return normalize_commit_num(override)
-    return raw_key
-
-
 # ---------------------------------------------------------------------------
 # INVOICE COMPARISON LOGIC
 # ---------------------------------------------------------------------------
@@ -2215,6 +2191,26 @@ def run_invoice_comparison():
     eb_inv  = _drop_total_rows(eb_inv,  "eBuilder")
     prv_inv = _drop_total_rows(prv_inv, "PRIVV")
 
+    # ── Hardcoded overrides ───────────────────────────────────────────────────
+    # Some eBuilder rows list "The Pennsylvania State University" in the
+    # Company field (the paying entity) instead of the actual vendor, which
+    # would otherwise cause _eb_company_belongs_to() to bucket them under the
+    # PSU OPP label. Force known rows like this to their correct vendor here,
+    # identified by Invoice # (and Commitment # as a safety check).
+    HARDCODED_INVOICE_VENDOR_OVERRIDES = {
+        # Invoice #: (Commitment #, forced Company/vendor label)
+        "86896": ("4100350409", "SC VINYL LLC"),
+    }
+    if "Invoice #" in eb_inv.columns:
+        for inv_num, (commit_num, forced_vendor) in HARDCODED_INVOICE_VENDOR_OVERRIDES.items():
+            mask = eb_inv["Invoice #"].astype(str).str.strip() == inv_num
+            if "Commitment #" in eb_inv.columns:
+                mask &= eb_inv["Commitment #"].astype(str).str.strip() == commit_num
+            n_hit = int(mask.sum())
+            if n_hit:
+                eb_inv.loc[mask, "Company"] = forced_vendor
+                inv_log(f"  Hardcoded override: Invoice #{inv_num} -> forced to vendor '{forced_vendor}' ({n_hit} row(s))")
+
     # Give every source row a stable, unique id BEFORE any matching happens.
     # Rows can legitimately get copied into more than one comparison row's
     # _eb_entries/_prv_entries during matching (Commitment # match, then
@@ -2254,7 +2250,7 @@ def run_invoice_comparison():
     # eBuilder  → Commitment # (e.g. "000925000")
     # PRIVV     → Vendor #     (e.g. "8103142")
     eb_inv["_commit_key"]  = eb_inv["Commitment #"].apply(normalize_commit_num)
-    prv_inv["_vendor_key"] = prv_inv.apply(_prv_vendor_key, axis=1)
+    prv_inv["_vendor_key"] = prv_inv["Vendor #"].apply(normalize_commit_num)
 
     # ── Build PRIVV lookup: vendor_key → rows ─────────────────────────────────
     prv_by_key: dict = {}
@@ -2353,21 +2349,53 @@ def run_invoice_comparison():
             return PSU_OPP_LABEL
         return vendor_name if vendor_name else f"#{vendor_num}"
 
-    prv_keys_seen: dict = {}  # key -> display label
+    prv_keys_seen: dict = {}  # normalized vendor name -> display label
     for _, row in prv_inv.iterrows():
-        k = row["_vendor_key"]
-        if k and k not in prv_keys_seen:
-            vendor_name = str(row.get("Vendor", "")).strip()
-            vendor_num  = str(row.get("Vendor #", "")).strip()
-            prv_keys_seen[k] = _make_label(vendor_name, vendor_num)
+        vendor_name = str(row.get("Vendor", "")).strip()
+        if not vendor_name:
+            continue
+        vendor_num = str(row.get("Vendor #", "")).strip()
+        label = _make_label(vendor_name, vendor_num)
+        nk = normalize(label)
+        if nk not in prv_keys_seen:
+            prv_keys_seen[nk] = label
 
-    for key, label in prv_keys_seen.items():
-        # PRIVV side: all rows for this Vendor #
-        prv_rows = prv_by_key.get(key, [])
+    # Group PRIVV rows by that same normalized vendor-name key.
+    prv_by_name: dict = {}
+    for _, row in prv_inv.iterrows():
+        vendor_name = str(row.get("Vendor", "")).strip()
+        if not vendor_name:
+            continue
+        vendor_num = str(row.get("Vendor #", "")).strip()
+        nk = normalize(_make_label(vendor_name, vendor_num))
+        prv_by_name.setdefault(nk, []).append(row)
+
+    def _eb_company_belongs_to(company: str, vendor_nk: str) -> bool:
+        """True if an eBuilder row's Company field identifies the same
+        vendor as the given (normalized) PRIVV vendor label. Checks the
+        full bidirectional alias-equivalents group first (so either the
+        short or long form of an aliased vendor name matches), then falls
+        back to exact/substring, then a fuzzy match on raw text."""
+        if not company:
+            return False
+        for equiv in alias_equivalents(company):
+            neq = normalize(equiv)
+            if neq == vendor_nk or (neq and (neq in vendor_nk or vendor_nk in neq)):
+                return True
+        nc = normalize(company)
+        if nc == vendor_nk or (nc and (nc in vendor_nk or vendor_nk in nc)):
+            return True
+        return fuzz.token_set_ratio(nc, vendor_nk) >= INV_FUZZY_THRESHOLD
+
+    for nk, label in prv_keys_seen.items():
+        # PRIVV side: all rows for this vendor name
+        prv_rows = prv_by_name.get(nk, [])
         prv_total = sum(float(r["_amount_num"]) for r in prv_rows)
 
-        # eBuilder side: all rows whose Commitment # normalizes to the same key
-        eb_mask = eb_inv["_commit_key"] == key
+        # eBuilder side: rows whose Company field identifies this vendor,
+        # via alias resolution (bidirectional) / exact / substring / fuzzy —
+        # not Commitment #/Vendor #.
+        eb_mask = eb_inv["Company"].apply(lambda c: _eb_company_belongs_to(c, nk))
         eb_total = eb_inv.loc[eb_mask, "_amount_num"].sum()
         eb_count = int(eb_mask.sum())
         all_matched_eb_indices.update(eb_inv[eb_mask].index.tolist())
@@ -2404,7 +2432,7 @@ def run_invoice_comparison():
         else:
             comparison_rows.append({
                 "Label":          label,
-                "Commit Key":     key,
+                "Commit Key":     "",
                 "PRIVV Total":    prv_total,
                 "eBuilder Total": eb_total,
                 "Delta":          delta,
@@ -2413,6 +2441,7 @@ def run_invoice_comparison():
                 "_eb_entries":    eb_inv[eb_mask].to_dict("records"),
                 "_prv_entries":   [dict(r) for r in prv_rows],
             })
+
 
     # ── Helper: add rows into the PSU OPP bucket ─────────────────────────────
     # PSU_OPP_LABEL / PSU_OPP_KEY are defined above in the label-building block.
@@ -3360,7 +3389,7 @@ tk.Button(
     width=16, padx=6
 ).pack(side="left", padx=4)
 
-# Load whatever is already in the sheet aWSs soon as the app starts, so
+# Load whatever is already in the sheet as soon as the app starts, so
 # resolve_alias() has the latest user-taught mappings from the very first
 # comparison/invoice run - not just after visiting this tab.
 refresh_alias_tree()
