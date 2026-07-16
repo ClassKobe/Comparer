@@ -98,3 +98,6 @@ This opens the GUI directly — there's no command-line mode.
 3. **Vendor Aliases tab:** whenever a vendor is matched incorrectly or not
    matched at all, add a Vendor Name → Alias pair here so future runs
    resolve it correctly.
+## Notes
+1. Do NOT upload the credentials.json to github or google as it will invalidate the key making it so the key no longer works. Meaning the code will not have access to the list of vendor allias and will make the program potentially throw an error.
+2. This code will only work on the PSU project
