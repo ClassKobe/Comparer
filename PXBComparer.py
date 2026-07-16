@@ -2015,7 +2015,7 @@ notebook.pack(fill="both", expand=True, padx=6, pady=6)
 # TAB 1 — COMPARISONS  (original UI, unchanged)
 # ════════════════════════════════════════════════════════════════════════════
 comp_tab = tk.Frame(notebook)
-notebook.add(comp_tab, text="Comparisons")
+notebook.add(comp_tab, text="Committed")
 
 frame = tk.Frame(comp_tab)
 frame.pack(pady=10, padx=10, fill="x")
