@@ -1,7 +1,7 @@
 # EBuilder → PRIVV Processor (Weighted Classifier + Fuzzy Match)
 
 ## Overview
-**EXPcomparerv11.py** is a sophisticated expense classification and vendor matching system that processes EBuilder commitment data and automatically assigns cost codes using a combination of weighted classification rules and fuzzy string matching algorithms.
+**EXPcomparer.py** is a sophisticated expense classification and vendor matching system that processes EBuilder commitment data and automatically assigns cost codes using a combination of weighted classification rules and fuzzy string matching algorithms.
 
 ## WARNING
 
