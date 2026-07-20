@@ -2,6 +2,8 @@ import os
 import pandas as pd
 import re
 import tkinter as tk
+import git  
+from git import Repo  
 from tkinter import filedialog, messagebox, ttk
 from rapidfuzz import fuzz, process
 import openpyxl
@@ -363,6 +365,58 @@ def normalize(text):
     text = re.sub(r"[^a-z0-9 ]", " ", text)
     text = re.sub(r"\s+", " ", text)
     return text.strip()
+
+
+def parse_money(val) -> float:
+    """Robustly parse a PRIVV/eBuilder amount string into a signed float.
+
+    Handles the messy formats these exports actually contain, including
+    negative values, e.g.:
+        "'-128334.77"    -> leading apostrophe (Excel text-escape) + minus sign
+        "-128,334.77"    -> minus sign with thousands separators
+        "(128334.77)"    -> accounting-style negative in parentheses
+        "$128,334.77"    -> currency symbol
+        " 128334.77 "    -> stray whitespace
+    Returns 0.0 for blank/unparseable values.
+    """
+    if val is None:
+        return 0.0
+    s = str(val).strip()
+    if not s:
+        return 0.0
+
+    # Strip a leading apostrophe some exports use to force text formatting
+    # (e.g. Excel/CSV "'-128334.77") before doing anything else.
+    s = s.lstrip("'")
+    s = s.strip()
+    if not s:
+        return 0.0
+
+    # Accounting-style negatives: (128334.77) -> -128334.77
+    is_paren_negative = s.startswith("(") and s.endswith(")")
+    if is_paren_negative:
+        s = s[1:-1].strip()
+
+    # Drop currency symbols, commas, and any remaining whitespace, but keep
+    # any leading +/- sign and the decimal point.
+    s = re.sub(r"[^0-9.\-+]", "", s)
+    if not s or s in ("-", "+", "."):
+        return 0.0
+
+    try:
+        num = float(s)
+    except ValueError:
+        return 0.0
+
+    if is_paren_negative:
+        num = -abs(num)
+
+    return num
+
+
+def parse_money_series(series: pd.Series) -> pd.Series:
+    """Vectorized wrapper around parse_money for a pandas Series."""
+    return series.apply(parse_money)
 
 
 # Threshold used by find_fuzzy_privv_matches below. Kept as a module-level
@@ -737,9 +791,7 @@ def run_comparison():
         messagebox.showerror("Error", "PRIVV file must have 'Vendor' and 'Amount' columns.")
         return
 
-    privv_df["_amount_num"] = pd.to_numeric(
-        privv_df["Amount"].str.replace(",", "", regex=False), errors="coerce"
-    ).fillna(0)
+    privv_df["_amount_num"] = parse_money_series(privv_df["Amount"])
     privv_total_all = privv_df["_amount_num"].sum()
     log(f"  PRIVV file loaded: {len(privv_df)} entries, total amount = ${privv_total_all:,.2f}")
 
@@ -1270,9 +1322,8 @@ def run_comparison():
         if "_amount_num" in fuzzy_matches.columns:
             fuzzy_total = fuzzy_matches["_amount_num"].sum()
         else:
-            fuzzy_total = pd.to_numeric(
-                fuzzy_matches.get("Amount", pd.Series(dtype=str)).astype(str).str.replace(",", "", regex=False),
-                errors="coerce",
+            fuzzy_total = parse_money_series(
+                fuzzy_matches.get("Amount", pd.Series(dtype=str)).astype(str)
             ).sum()
         if abs(fuzzy_total - r["PRIVV Total"]) > 0.005:
             log(f"  Fuzzy PRIVV total fix: '{r['Vendor']}' "
@@ -1616,9 +1667,8 @@ def show_comparison_window(rows, privv_df):
         if "_amount_num" in privv_matches.columns:
             privv_total_fuzzy = privv_matches["_amount_num"].sum()
         else:
-            privv_total_fuzzy = pd.to_numeric(
-                privv_matches.get("Amount", pd.Series(dtype=str)).astype(str).str.replace(",", "", regex=False),
-                errors="coerce",
+            privv_total_fuzzy = parse_money_series(
+                privv_matches.get("Amount", pd.Series(dtype=str)).astype(str)
             ).sum()
 
         detail = tk.Toplevel(win)
@@ -2015,7 +2065,7 @@ notebook.pack(fill="both", expand=True, padx=6, pady=6)
 # TAB 1 — COMPARISONS  (original UI, unchanged)
 # ════════════════════════════════════════════════════════════════════════════
 comp_tab = tk.Frame(notebook)
-notebook.add(comp_tab, text="Committed")
+notebook.add(comp_tab, text="Comparisons")
 
 frame = tk.Frame(comp_tab)
 frame.pack(pady=10, padx=10, fill="x")
@@ -2240,9 +2290,7 @@ def run_invoice_comparison():
         eb_inv["Invoice Amount"].str.replace(",", "", regex=False), errors="coerce"
     ).fillna(0)
 
-    prv_inv["_amount_num"] = pd.to_numeric(
-        prv_inv["Amount"].str.replace(",", "", regex=False), errors="coerce"
-    ).fillna(0)
+    prv_inv["_amount_num"] = parse_money_series(prv_inv["Amount"])
 
     # ── Normalize join keys ───────────────────────────────────────────────────
     # eBuilder  → Commitment # (e.g. "000925000")
