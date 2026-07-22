@@ -2,8 +2,6 @@ import os
 import pandas as pd
 import re
 import tkinter as tk
-import git  
-from git import Repo  
 from tkinter import filedialog, messagebox, ttk
 from rapidfuzz import fuzz, process
 import openpyxl
